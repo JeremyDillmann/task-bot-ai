@@ -1,4 +1,4 @@
-// bot.js - Mit GPT-4 und Update-Funktion
+// bot.js - Task Bot with GPT-4 and Google Sheets
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -227,7 +227,7 @@ Verstehe was der User will und führe die passende Aktion aus.
 Antworte KURZ und DIREKT auf Deutsch.`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',  // Changed to GPT-4
+      model: 'gpt-4',
       messages: [
         { 
           role: 'system', 
@@ -326,15 +326,26 @@ Antworte KURZ und DIREKT auf Deutsch.`;
     
   } catch (error) {
     console.error('AI Error:', error);
-    // Fallback
+    // Fallback ohne AI
     if (text.match(/aufgabe|liste|zeige|was muss|was soll/i)) {
       const tasks = await getAllTasks();
       return formatTaskList(tasks);
     }
-    if (text.match(/änder|umbenenn|statt/i)) {
-      return 'Zum Ändern sage z.B.: "Ändere X zu Y"';
+    if (text.match(/erledigt|fertig|done/i)) {
+      const taskName = text.replace(/erledigt|fertig|done/gi, '').trim();
+      if (taskName) {
+        const completed = await completeTask(taskName);
+        if (completed) {
+          return `✅ "${completed}" erledigt!`;
+        }
+        return `Finde "${taskName}" nicht.`;
+      }
+      return 'Was ist erledigt?';
     }
-    return 'Verstehe ich nicht. Sag es anders?';
+    if (text.match(/änder|umbenenn|statt/i)) {
+      return 'Zum Ändern sage: "Ändere X zu Y"';
+    }
+    return 'Verstehe ich nicht. Versuch: "zeige aufgaben" oder "X erledigt"';
   }
 }
 
@@ -382,8 +393,43 @@ bot.on('message', async (msg) => {
   }
 });
 
+// Error handling
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error);
+});
+
+bot.on('error', (error) => {
+  console.error('Bot error:', error);
+});
+
+// Startup
 console.log('🚀 Bot läuft mit GPT-4!');
 console.log(`📊 Sheet: ${process.env.GOOGLE_SHEET_URL}`);
 
 // Clean duplicates on startup
-removeDuplicates();
+removeDuplicates().then(count => {
+  if (count > 0) {
+    console.log(`🧹 ${count} Duplikate entfernt`);
+  }
+});
+
+// Keep process alive for Railway
+process.stdin.resume();
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nBot stopping...');
+  bot.stopPolling();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\nBot stopping...');
+  bot.stopPolling();
+  process.exit(0);
+});
+
+// Keep alive ping
+setInterval(() => {
+  console.log('Bot still running...');
+}, 5 * 60 * 1000); // Every 5 minutes
