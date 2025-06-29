@@ -1,10 +1,22 @@
-// bot.js - Task Bot with GPT-4 and Google Sheets
+// bot.js - Mit Railway Support
 require('dotenv').config();
+const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
 const { google } = require('googleapis');
 
-// Initialize
+// WICHTIG: HTTP Server für Railway
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Task Bot is running!');
+});
+
+server.listen(PORT, () => {
+  console.log(`✅ HTTP Server running on port ${PORT}`);
+});
+
+// Initialize Bot
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -405,6 +417,7 @@ bot.on('error', (error) => {
 // Startup
 console.log('🚀 Bot läuft mit GPT-4!');
 console.log(`📊 Sheet: ${process.env.GOOGLE_SHEET_URL}`);
+console.log(`🌐 HTTP Server: http://localhost:${PORT}`);
 
 // Clean duplicates on startup
 removeDuplicates().then(count => {
@@ -413,23 +426,17 @@ removeDuplicates().then(count => {
   }
 });
 
-// Keep process alive for Railway
-process.stdin.resume();
-
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\nBot stopping...');
+  console.log('\nShutting down gracefully...');
   bot.stopPolling();
+  server.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  console.log('\nBot stopping...');
+  console.log('\nShutting down gracefully...');
   bot.stopPolling();
+  server.close();
   process.exit(0);
 });
-
-// Keep alive ping
-setInterval(() => {
-  console.log('Bot still running...');
-}, 5 * 60 * 1000); // Every 5 minutes
