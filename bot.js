@@ -1,22 +1,10 @@
-// bot.js - Mit Railway Support
+// bot.js - Clean version without HTTP server
 require('dotenv').config();
-const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
 const { google } = require('googleapis');
 
-// WICHTIG: HTTP Server für Railway
-const PORT = process.env.PORT || 3000;
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Task Bot is running!');
-});
-
-server.listen(PORT, () => {
-  console.log(`✅ HTTP Server running on port ${PORT}`);
-});
-
-// Initialize Bot
+// Initialize
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -239,7 +227,7 @@ Verstehe was der User will und führe die passende Aktion aus.
 Antworte KURZ und DIREKT auf Deutsch.`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-4.1',
       messages: [
         { 
           role: 'system', 
@@ -414,11 +402,6 @@ bot.on('error', (error) => {
   console.error('Bot error:', error);
 });
 
-// Startup
-console.log('🚀 Bot läuft mit GPT-4!');
-console.log(`📊 Sheet: ${process.env.GOOGLE_SHEET_URL}`);
-console.log(`🌐 HTTP Server: http://localhost:${PORT}`);
-
 // Clean duplicates on startup
 removeDuplicates().then(count => {
   if (count > 0) {
@@ -426,17 +409,27 @@ removeDuplicates().then(count => {
   }
 });
 
+// Startup
+console.log('🚀 Bot läuft mit GPT-4!');
+console.log(`📊 Sheet: ${process.env.GOOGLE_SHEET_URL}`);
+
+// WICHTIG: Prevent process from exiting
+// This keeps the bot running on Railway
+require('events').EventEmitter.defaultMaxListeners = 0;
+process.stdin.resume();
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\nShutting down gracefully...');
+  console.log('\nBot stopping...');
   bot.stopPolling();
-  server.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  console.log('\nShutting down gracefully...');
+  console.log('\nBot stopping...');
   bot.stopPolling();
-  server.close();
   process.exit(0);
 });
