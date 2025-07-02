@@ -1,4 +1,4 @@
-// bot.js - With Railway HTTP server fix
+// bot.js - Railway Webhook Version
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -7,7 +7,12 @@ const express = require('express');
 
 // Initialize Express server for Railway
 const app = express();
+app.use(express.json()); // IMPORTANT: Parse JSON bodies
 const PORT = process.env.PORT || 3000;
+
+// Initialize Bot (without polling)
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Health check endpoints
 app.get('/', (req, res) => {
@@ -18,18 +23,16 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    webhook_set: bot.isPolling !== undefined ? false : true
   });
 });
 
-// Start HTTP server - MUST bind to 0.0.0.0 for Railway
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 HTTP Server running on port ${PORT}`);
+// Webhook endpoint for Telegram
+app.post(`/bot${process.env.TELEGRAM_BOT_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
-
-// Initialize Bot and APIs
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Google Sheets auth
 let auth;
@@ -416,21 +419,50 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Error handling with auto-recovery
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error.code, error.message);
+// Start HTTP server and set webhook
+const server = app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`🌐 HTTP Server running on port ${PORT}`);
   
-  // Auto-restart polling after 5 seconds
-  setTimeout(() => {
-    if (!bot.isPolling()) {
-      console.log('Restarting polling...');
-      bot.startPolling();
+  // Set webhook when server starts
+  try {
+    // Check if RAILWAY_STATIC_URL is available
+    if (!process.env.RAILWAY_STATIC_URL) {
+      console.error('❌ RAILWAY_STATIC_URL not found! Running in local mode.');
+      console.log('ℹ️  For local development, use ngrok or similar to expose your webhook.');
+      return;
     }
-  }, 5000);
+    
+    const webhookUrl = `${process.env.RAILWAY_STATIC_URL}/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+    console.log(`🔄 Setting webhook to: ${webhookUrl}`);
+    
+    // Delete any existing webhook first
+    await bot.deleteWebHook();
+    
+    // Set new webhook
+    const result = await bot.setWebHook(webhookUrl);
+    
+    if (result) {
+      console.log(`✅ Webhook successfully set!`);
+      const info = await bot.getWebHookInfo();
+      console.log(`📡 Webhook info:`, {
+        url: info.url,
+        has_custom_certificate: info.has_custom_certificate,
+        pending_update_count: info.pending_update_count
+      });
+    } else {
+      console.error('❌ Failed to set webhook');
+    }
+  } catch (error) {
+    console.error('❌ Error setting webhook:', error.message);
+    if (error.response) {
+      console.error('Response:', error.response.body);
+    }
+  }
 });
 
-bot.on('error', (error) => {
-  console.error('Bot error:', error);
+// Ensure server is listening before exit
+server.on('listening', () => {
+  console.log('✅ Server is listening and ready');
 });
 
 // Clean duplicates on startup
@@ -443,9 +475,10 @@ removeDuplicates().then(count => {
 // Startup logs
 console.log('🚀 Bot läuft mit GPT-4!');
 console.log(`📊 Sheet: ${process.env.GOOGLE_SHEET_URL}`);
-console.log(`🌐 Health endpoint: http://localhost:${PORT}/health`);
+console.log(`🔧 Environment: ${process.env.RAILWAY_STATIC_URL ? 'Railway' : 'Local'}`);
+console.log(`🌐 Port: ${PORT}`);
 
-// Keep alive ping
+// Keep alive ping (optional, but can help with Railway)
 setInterval(() => {
   console.log(`Bot alive at ${new Date().toISOString()}`);
 }, 60000); // Every minute
@@ -454,7 +487,9 @@ setInterval(() => {
 const gracefulShutdown = async (signal) => {
   console.log(`\nReceived ${signal}, shutting down gracefully...`);
   try {
-    await bot.stopPolling();
+    // Delete webhook before shutting down
+    await bot.deleteWebHook();
+    console.log('Webhook deleted');
     process.exit(0);
   } catch (err) {
     console.error('Error during shutdown:', err);
