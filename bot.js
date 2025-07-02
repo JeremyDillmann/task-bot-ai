@@ -1,4 +1,4 @@
-// bot.js - Full version with AI
+// bot.js - Full version with AI and task assignment
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -118,7 +118,7 @@ async function getAllTasks() {
   }
 }
 
-// Add tasks with date parsing
+// Add tasks with date parsing and person assignment
 async function addTasks(tasks, userName) {
   const existingTasks = await getAllTasks();
   const date = new Date().toISOString().split('T')[0];
@@ -292,7 +292,7 @@ async function removeDuplicates() {
   return toDelete.length;
 }
 
-// Format task list
+// Format task list with person filter
 function formatTaskList(tasks, filterPerson = null) {
   const active = tasks.filter(t => t.status !== 'done');
   
@@ -366,20 +366,6 @@ Beispiele:
 - "Ich muss putzen" = Aufgabe "putzen" für den Absender
 
 Antworte auf Deutsch.`
-        {
-          type: 'function',
-          function: {
-            name: 'assign_task',
-            description: 'Weise eine existierende Aufgabe einer Person zu',
-            parameters: {
-              type: 'object',
-              properties: {
-                taskName: { type: 'string', description: 'Name der Aufgabe' },
-                person: { type: 'string', description: 'Person, der die Aufgabe zugewiesen wird' }
-              },
-              required: ['taskName', 'person']
-            }
-          }
         },
         { 
           role: 'user', 
@@ -420,7 +406,8 @@ Antworte auf Deutsch.`
                         type: 'string', 
                         enum: ['shopping', 'household', 'personal', 'work', 'general'],
                         description: 'Kategorie'
-                      }
+                      },
+                      assignedTo: { type: 'string', description: 'Person, die die Aufgabe machen soll (optional)' }
                     },
                     required: ['task']
                   },
@@ -499,6 +486,21 @@ Antworte auf Deutsch.`
                 time_available: { type: 'string', description: 'Verfügbare Zeit (z.B. "10 Minuten", "1 Stunde")' },
                 location: { type: 'string', description: 'Aktueller Ort (z.B. "zuhause", "unterwegs", "Büro")' }
               }
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'assign_task',
+            description: 'Weise eine existierende Aufgabe einer Person zu',
+            parameters: {
+              type: 'object',
+              properties: {
+                taskName: { type: 'string', description: 'Name der Aufgabe' },
+                person: { type: 'string', description: 'Person, der die Aufgabe zugewiesen wird' }
+              },
+              required: ['taskName', 'person']
             }
           }
         }
@@ -654,22 +656,11 @@ function suggestTasks(tasks, timeAvailable, location) {
 // Message handler
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  let text = msg.text?.trim();
+  const text = msg.text?.trim();
   if (!text) return;
   
   const userName = msg.from.first_name || 'User';
   const isGroup = msg.chat.type !== 'private';
-  let isMentioned = false;
-  
-  // Check if bot is mentioned
-  if (isGroup) {
-    const botUsername = (await bot.getMe()).username;
-    isMentioned = text.includes(`@${botUsername}`);
-    if (isMentioned) {
-      // Remove bot mention from text for cleaner processing
-      text = text.replace(`@${botUsername}`, '').trim();
-    }
-  }
   
   console.log(`Message from ${userName} in ${isGroup ? 'group' : 'private'}: ${text}`);
   
@@ -693,14 +684,22 @@ Sag einfach was du brauchst:
 • "Einkaufen bei Rewe"
 • "Müll ist erledigt"
 • "Lösche Bad putzen"
+• "Moana muss morgen aufräumen"
 
 📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Not set'}`);
       return;
     }
     
-    // Try AI first
+    // Try AI - always process messages
     if (openai) {
-      const aiResponse = await handleAI(text, tasks, userName, false); // Always respond, don't check group status
+      // Clean text for processing (remove bot mentions)
+      let cleanText = text;
+      if (isGroup) {
+        const botUsername = (await bot.getMe()).username;
+        cleanText = text.replace(`@${botUsername}`, '').trim();
+      }
+      
+      const aiResponse = await handleAI(cleanText, tasks, userName, false);
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
         return;
@@ -799,4 +798,3 @@ setInterval(() => {
 }, 30000);
 
 console.log('Starting bot WITH AI...');
-// Comment so it updates
