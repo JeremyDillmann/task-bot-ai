@@ -112,8 +112,8 @@ async function addTasks(tasks, userName) {
   return newTasks.length;
 }
 
-// Complete task
-async function completeTask(taskName) {
+// Update task
+async function updateTask(taskName, updates) {
   const tasks = await getAllTasks();
   const task = tasks.find(t => 
     t.task.toLowerCase().includes(taskName.toLowerCase()) && 
@@ -121,15 +121,74 @@ async function completeTask(taskName) {
   );
   
   if (task) {
+    const updatedRow = [
+      task.date,
+      task.person,
+      updates.task || task.task,
+      updates.location || task.location,
+      updates.when || task.when,
+      updates.category || task.category,
+      task.status
+    ];
+    
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `A${task.row}:G${task.row}`,
+      valueInputOption: 'RAW',
+      resource: { values: [updatedRow] }
+    });
+    
+    return true;
+  }
+  return false;
+}
+
+// Complete all tasks
+async function completeAllTasks() {
+  const tasks = await getAllTasks();
+  const activeTasks = tasks.filter(t => t.status !== 'done');
+  
+  let completed = 0;
+  for (const task of activeTasks) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `G${task.row}`,
       valueInputOption: 'RAW',
       resource: { values: [['done']] }
     });
-    return task.task;
+    completed++;
   }
-  return null;
+  
+  return completed;
+}
+
+// Remove duplicates
+async function removeDuplicates() {
+  const tasks = await getAllTasks();
+  const seen = new Map();
+  const toDelete = [];
+  
+  tasks.forEach(task => {
+    if (task.status === 'done') return;
+    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
+    
+    if (seen.has(key)) {
+      toDelete.push(task.row);
+    } else {
+      seen.set(key, task);
+    }
+  });
+  
+  toDelete.sort((a, b) => b - a);
+  
+  for (const row of toDelete) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `A${row}:G${row}`,
+    });
+  }
+  
+  return toDelete.length;
 }
 
 // Format task list
@@ -188,7 +247,11 @@ Determine what action to take. Reply in German.`;
 - For showing tasks: {"action": "show"}
 - For adding: {"action": "add", "tasks": [{"task": "...", "location": "...", "when": "...", "category": "shopping|household|personal|work|general"}]}
 - For completing: {"action": "complete", "taskName": "..."}
-- For chat: {"action": "chat", "message": "..."}` 
+- For completing ALL: {"action": "completeAll"}
+- For updating when/date: {"action": "update", "taskName": "...", "when": "..."}
+- For chat: {"action": "chat", "message": "..."}
+
+When user says something like "X würde ich Y machen" or "X auf Y verschieben", update the task's when field.` 
         },
         { role: 'user', content: context }
       ],
@@ -213,6 +276,16 @@ Determine what action to take. Reply in German.`;
       return completed ? `✅ "${completed}" erledigt!` : `Nicht gefunden: "${result.taskName}"`;
     }
     
+    if (result.action === 'completeAll') {
+      const count = await completeAllTasks();
+      return count > 0 ? `✅ Alle ${count} Aufgaben erledigt!` : 'Keine aktiven Aufgaben';
+    }
+    
+    if (result.action === 'update' && result.taskName) {
+      const success = await updateTask(result.taskName, { when: result.when });
+      return success ? `✅ "${result.taskName}" verschoben auf ${result.when}` : `Nicht gefunden: "${result.taskName}"`;
+    }
+    
     if (result.action === 'chat' && result.message) {
       return result.message;
     }
@@ -234,6 +307,12 @@ bot.on('message', async (msg) => {
   console.log(`Message from ${userName}: ${text}`);
   
   try {
+    // Remove duplicates first
+    const duplicatesRemoved = await removeDuplicates();
+    if (duplicatesRemoved > 0) {
+      console.log(`Removed ${duplicatesRemoved} duplicate tasks`);
+    }
+    
     // Get current tasks
     const tasks = await getAllTasks();
     
