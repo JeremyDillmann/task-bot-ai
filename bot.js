@@ -12,8 +12,14 @@ const PORT = process.env.PORT || 3000;
 // Initialize Bot
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
-// Health check
+// Health check - log all requests
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.path}`);
+  next();
+});
+
 app.get('/', (req, res) => res.send('Bot is running!'));
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
 // Telegram webhook
 app.post(`/webhook`, (req, res) => {
@@ -128,16 +134,61 @@ bot.on('message', async (msg) => {
 });
 
 // Start server
-app.listen(PORT, '0.0.0.0', async () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server on port ${PORT}`);
   
-  try {
-    const WEBHOOK_URL = `https://task-bot-ai-production.up.railway.app/webhook`;
-    await bot.setWebHook(WEBHOOK_URL);
-    console.log('✅ Webhook set to:', WEBHOOK_URL);
-  } catch (error) {
-    console.error('❌ Webhook error:', error.message);
-  }
+  // Set webhook after server is listening
+  setTimeout(async () => {
+    try {
+      const WEBHOOK_URL = `https://task-bot-ai-production.up.railway.app/webhook`;
+      
+      // First delete any existing webhook
+      console.log('Deleting old webhook...');
+      await bot.deleteWebHook();
+      
+      // Then set new webhook
+      console.log('Setting new webhook...');
+      const result = await bot.setWebHook(WEBHOOK_URL);
+      console.log('✅ Webhook set to:', WEBHOOK_URL, 'Result:', result);
+      
+      // Verify webhook
+      const info = await bot.getWebHookInfo();
+      console.log('Webhook info:', info);
+      
+    } catch (error) {
+      console.error('❌ Webhook error:', error.message);
+      // Don't exit on webhook error
+    }
+  }, 2000);
+});
+
+// Keep process alive
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received - ignoring to stay alive');
+  // DON'T exit on SIGTERM in production
+  // Railway sends these but we want to keep running
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received - shutting down');
+  process.exit(0);
+});
+
+// Prevent process from exiting
+process.stdin.resume();
+
+// Heartbeat
+setInterval(() => {
+  console.log('💓 Bot alive at', new Date().toISOString());
+}, 30000); // Every 30 seconds
+
+// Error handling
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled Rejection:', error);
 });
 
 console.log('Starting bot WITHOUT AI...');
