@@ -1,32 +1,4 @@
-// Remove duplicates
-async function removeDuplicates() {
-  const tasks = await getAllTasks();
-  const seen = new Map();
-  const toDelete = [];
-  
-  tasks.forEach(task => {
-    if (task.status === 'done') return;
-    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
-    
-    if (seen.has(key)) {
-      toDelete.push(task.row);
-    } else {
-      seen.set(key, task);
-    }
-  });
-  
-  toDelete.sort((a, b) => b - a);
-  
-  for (const row of toDelete) {
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: `A${row}:G${row}`,
-    });
-  }
-  
-  return toDelete.length;
-}- For deleting one: {"action": "delete", "taskName": "..."}
-- For deleting ALL: {"action": "deleteAll"}// bot.js - Full version with AI
+// bot.js - Full version with AI
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -78,31 +50,6 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: 'v4', auth });
 
-// Get all tasks
-async function getAllTasks() {
-  try {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: 'A2:G',
-    });
-    
-    const rows = response.data.values || [];
-    return rows.map((row, index) => ({
-      row: index + 2,
-      date: row[0] || '',
-      person: row[1] || '',
-      task: row[2] || '',
-      location: row[3] || '',
-      when: row[4] || '',
-      category: row[5] || 'general',
-      status: row[6] || 'pending'
-    }));
-  } catch (error) {
-    console.error('Sheets error:', error.message);
-    return [];
-  }
-}
-
 // Helper to parse dates
 function parseDate(dateStr) {
   const today = new Date();
@@ -146,6 +93,31 @@ function getNextWeekday(dayOfWeek) {
   return result;
 }
 
+// Get all tasks
+async function getAllTasks() {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: 'A2:G',
+    });
+    
+    const rows = response.data.values || [];
+    return rows.map((row, index) => ({
+      row: index + 2,
+      date: row[0] || '',
+      person: row[1] || '',
+      task: row[2] || '',
+      location: row[3] || '',
+      when: row[4] || '',
+      category: row[5] || 'general',
+      status: row[6] || 'pending'
+    }));
+  } catch (error) {
+    console.error('Sheets error:', error.message);
+    return [];
+  }
+}
+
 // Add tasks with date parsing
 async function addTasks(tasks, userName) {
   const existingTasks = await getAllTasks();
@@ -181,6 +153,26 @@ async function addTasks(tasks, userName) {
   }
   
   return newTasks.length;
+}
+
+// Complete task
+async function completeTask(taskName) {
+  const tasks = await getAllTasks();
+  const task = tasks.find(t => 
+    t.task.toLowerCase().includes(taskName.toLowerCase()) && 
+    t.status !== 'done'
+  );
+  
+  if (task) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `G${task.row}`,
+      valueInputOption: 'RAW',
+      resource: { values: [['done']] }
+    });
+    return task.task;
+  }
+  return null;
 }
 
 // Update task
@@ -269,6 +261,35 @@ async function deleteAllTasks() {
   }
   
   return deleted;
+}
+
+// Remove duplicates
+async function removeDuplicates() {
+  const tasks = await getAllTasks();
+  const seen = new Map();
+  const toDelete = [];
+  
+  tasks.forEach(task => {
+    if (task.status === 'done') return;
+    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
+    
+    if (seen.has(key)) {
+      toDelete.push(task.row);
+    } else {
+      seen.set(key, task);
+    }
+  });
+  
+  toDelete.sort((a, b) => b - a);
+  
+  for (const row of toDelete) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `A${row}:G${row}`,
+    });
+  }
+  
+  return toDelete.length;
 }
 
 // Format task list
@@ -400,7 +421,7 @@ ${isGroup ? 'In group chats, respond with {"action": "ignore"} for general conve
 // Message handler
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const text = msg.text?.trim();
+  let text = msg.text?.trim();
   if (!text) return;
   
   const userName = msg.from.first_name || 'User';
@@ -438,6 +459,7 @@ Sag einfach was du brauchst:
 • "Was muss ich machen?"
 • "Einkaufen bei Rewe"
 • "Müll ist erledigt"
+• "Lösche Bad putzen"
 
 📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Not set'}`);
       return;
