@@ -1,6 +1,7 @@
-// bot.js - NO AI VERSION - Test first!
+// bot.js - Full version with AI
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
+const OpenAI = require('openai');
 const { google } = require('googleapis');
 const express = require('express');
 
@@ -12,14 +13,29 @@ const PORT = process.env.PORT || 3000;
 // Initialize Bot
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
-// Health check - log all requests
+// Initialize OpenAI - with error checking
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  try {
+    openai = new OpenAI({ 
+      apiKey: process.env.OPENAI_API_KEY.trim()
+    });
+    console.log('✅ OpenAI initialized');
+  } catch (error) {
+    console.error('❌ OpenAI init error:', error.message);
+  }
+} else {
+  console.log('⚠️  No OpenAI key - running without AI');
+}
+
+// Health check - log requests
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.path}`);
   next();
 });
 
 app.get('/', (req, res) => res.send('Bot is running!'));
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', ai: !!openai }));
 
 // Telegram webhook
 app.post(`/webhook`, (req, res) => {
@@ -45,15 +61,55 @@ async function getAllTasks() {
     const rows = response.data.values || [];
     return rows.map((row, index) => ({
       row: index + 2,
+      date: row[0] || '',
+      person: row[1] || '',
       task: row[2] || '',
       location: row[3] || '',
       when: row[4] || '',
+      category: row[5] || 'general',
       status: row[6] || 'pending'
     }));
   } catch (error) {
     console.error('Sheets error:', error.message);
     return [];
   }
+}
+
+// Add tasks
+async function addTasks(tasks, userName) {
+  const existingTasks = await getAllTasks();
+  const date = new Date().toISOString().split('T')[0];
+  const newTasks = [];
+  
+  for (const task of tasks) {
+    const exists = existingTasks.some(existing => 
+      existing.task.toLowerCase() === task.task.toLowerCase() &&
+      existing.status !== 'done'
+    );
+    
+    if (!exists) {
+      newTasks.push([
+        date,
+        userName,
+        task.task,
+        task.location || '',
+        task.when || '',
+        task.category || 'general',
+        'pending'
+      ]);
+    }
+  }
+  
+  if (newTasks.length > 0) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: 'A:G',
+      valueInputOption: 'RAW',
+      resource: { values: newTasks }
+    });
+  }
+  
+  return newTasks.length;
 }
 
 // Complete task
@@ -76,43 +132,142 @@ async function completeTask(taskName) {
   return null;
 }
 
-// Message handler - SUPER SIMPLE
+// Format task list
+function formatTaskList(tasks) {
+  const active = tasks.filter(t => t.status !== 'done');
+  
+  if (active.length === 0) return 'Alles erledigt! 🎉';
+  
+  const byCategory = {};
+  active.forEach(t => {
+    const cat = t.category || 'general';
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push(t);
+  });
+  
+  let response = `📋 Du hast ${active.length} Aufgaben:\n\n`;
+  
+  Object.entries(byCategory).forEach(([cat, tasks]) => {
+    const emoji = {
+      shopping: '🛒',
+      household: '🏠',
+      personal: '👤',
+      work: '💼',
+      general: '📋'
+    }[cat] || '📋';
+    
+    response += `${emoji} ${cat.toUpperCase()}:\n`;
+    tasks.forEach(t => {
+      response += `• ${t.task}`;
+      if (t.location) response += ` @${t.location}`;
+      if (t.when) response += ` (${t.when})`;
+      response += '\n';
+    });
+    response += '\n';
+  });
+  
+  return response;
+}
+
+// AI handler
+async function handleAI(text, tasks, userName) {
+  if (!openai) return null;
+  
+  try {
+    const activeTasks = tasks.filter(t => t.status !== 'done');
+    const context = `Current tasks: ${activeTasks.map(t => t.task).join(', ')}
+User says: "${text}"
+Determine what action to take. Reply in German.`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { 
+          role: 'system', 
+          content: `You are a task bot. Understand user intent and respond with JSON:
+- For showing tasks: {"action": "show"}
+- For adding: {"action": "add", "tasks": [{"task": "...", "location": "...", "when": "...", "category": "shopping|household|personal|work|general"}]}
+- For completing: {"action": "complete", "taskName": "..."}
+- For chat: {"action": "chat", "message": "..."}` 
+        },
+        { role: 'user', content: context }
+      ],
+      temperature: 0.3,
+      response_format: { type: "json_object" }
+    });
+    
+    const result = JSON.parse(completion.choices[0].message.content);
+    console.log('AI result:', result);
+    
+    if (result.action === 'show') {
+      return formatTaskList(tasks);
+    }
+    
+    if (result.action === 'add' && result.tasks) {
+      const count = await addTasks(result.tasks, userName);
+      return count > 0 ? `✅ ${count} neue Aufgaben hinzugefügt` : 'Diese Aufgaben existieren schon';
+    }
+    
+    if (result.action === 'complete' && result.taskName) {
+      const completed = await completeTask(result.taskName);
+      return completed ? `✅ "${completed}" erledigt!` : `Nicht gefunden: "${result.taskName}"`;
+    }
+    
+    if (result.action === 'chat' && result.message) {
+      return result.message;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('AI Error:', error.message);
+    return null;
+  }
+}
+
+// Message handler
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
   if (!text) return;
   
-  console.log(`Got message: ${text}`);
+  const userName = msg.from.first_name || 'User';
+  console.log(`Message from ${userName}: ${text}`);
   
   try {
-    // Test command
-    if (text === '/test') {
-      await bot.sendMessage(chatId, '✅ Bot works!');
+    // Get current tasks
+    const tasks = await getAllTasks();
+    
+    // Commands
+    if (text === '/start' || text === '/help') {
+      await bot.sendMessage(chatId, 
+`Hallo! Ich bin dein Aufgaben-Bot 🤖
+
+Sag einfach was du brauchst:
+• "Was muss ich machen?"
+• "Einkaufen bei Rewe"
+• "Müll ist erledigt"
+
+📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Not set'}`);
       return;
     }
     
-    // Show tasks
-    if (text.match(/aufgabe|liste|zeige/i)) {
-      const tasks = await getAllTasks();
-      const active = tasks.filter(t => t.status !== 'done');
-      
-      if (active.length === 0) {
-        await bot.sendMessage(chatId, 'Keine Aufgaben! 🎉');
-      } else {
-        let message = `📋 ${active.length} Aufgaben:\n\n`;
-        active.forEach(t => {
-          message += `• ${t.task}`;
-          if (t.location) message += ` @${t.location}`;
-          message += '\n';
-        });
-        await bot.sendMessage(chatId, message);
+    // Try AI first
+    if (openai) {
+      const aiResponse = await handleAI(text, tasks, userName);
+      if (aiResponse) {
+        await bot.sendMessage(chatId, aiResponse);
+        return;
       }
+    }
+    
+    // Fallback patterns if AI fails
+    if (text.match(/aufgabe|liste|zeige|was muss/i)) {
+      await bot.sendMessage(chatId, formatTaskList(tasks));
       return;
     }
     
-    // Complete task
-    if (text.match(/erledigt|done/i)) {
-      const taskName = text.replace(/erledigt|done/gi, '').trim();
+    if (text.match(/erledigt|fertig|done/i)) {
+      const taskName = text.replace(/erledigt|fertig|done/gi, '').trim();
       if (taskName) {
         const completed = await completeTask(taskName);
         if (completed) {
@@ -125,11 +280,11 @@ bot.on('message', async (msg) => {
     }
     
     // Default
-    await bot.sendMessage(chatId, 'Commands:\n/test\nzeige aufgaben\nX erledigt');
+    await bot.sendMessage(chatId, 'Ich verstehe nicht. Versuch: "zeige aufgaben" oder "X erledigt"');
     
   } catch (error) {
     console.error('Error:', error.message);
-    await bot.sendMessage(chatId, '❌ Error: ' + error.message);
+    await bot.sendMessage(chatId, '❌ Fehler: ' + error.message);
   }
 });
 
@@ -142,53 +297,45 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     try {
       const WEBHOOK_URL = `https://task-bot-ai-production.up.railway.app/webhook`;
       
-      // First delete any existing webhook
       console.log('Deleting old webhook...');
       await bot.deleteWebHook();
       
-      // Then set new webhook
       console.log('Setting new webhook...');
       const result = await bot.setWebHook(WEBHOOK_URL);
-      console.log('✅ Webhook set to:', WEBHOOK_URL, 'Result:', result);
+      console.log('✅ Webhook set:', result);
       
-      // Verify webhook
       const info = await bot.getWebHookInfo();
       console.log('Webhook info:', info);
       
     } catch (error) {
       console.error('❌ Webhook error:', error.message);
-      // Don't exit on webhook error
     }
   }, 2000);
 });
 
-// Keep process alive
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received - ignoring to stay alive');
-  // DON'T exit on SIGTERM in production
-  // Railway sends these but we want to keep running
+// Keep alive - IGNORE SIGTERM
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received - IGNORING (staying alive)');
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received - shutting down');
-  process.exit(0);
+  console.log('SIGINT received - IGNORING (staying alive)');
 });
 
-// Prevent process from exiting
-process.stdin.resume();
-
-// Heartbeat
-setInterval(() => {
-  console.log('💓 Bot alive at', new Date().toISOString());
-}, 30000); // Every 30 seconds
-
-// Error handling
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
+  process.exit(1);
 });
 
 process.on('unhandledRejection', (error) => {
   console.error('Unhandled Rejection:', error);
 });
 
-console.log('Starting bot WITHOUT AI...');
+process.stdin.resume();
+
+// Heartbeat
+setInterval(() => {
+  console.log('💓 Bot alive at', new Date().toISOString());
+}, 30000);
+
+console.log('Starting bot WITH AI...');
