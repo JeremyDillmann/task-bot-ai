@@ -329,93 +329,259 @@ function formatTaskList(tasks) {
   return response;
 }
 
-// AI handler
+// AI handler with tool calling
 async function handleAI(text, tasks, userName, isGroup = false) {
   if (!openai) return null;
   
   try {
     const activeTasks = tasks.filter(t => t.status !== 'done');
-    const context = `Current tasks: ${activeTasks.map(t => t.task).join(', ')}
-User says: "${text}"
-${isGroup ? 'This is in a group chat. Only respond if the message is clearly task-related or addressing the bot.' : ''}
-Determine what action to take. Reply in German.`;
-
+    
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { 
           role: 'system', 
-          content: `You are a task bot. Understand user intent and respond with JSON:
-- For showing tasks: {"action": "show"}
-- For adding: {"action": "add", "tasks": [{"task": "...", "location": "...", "when": "...", "category": "shopping|household|personal|work|general"}]}
-- For completing: {"action": "complete", "taskName": "..."}
-- For completing ALL: {"action": "completeAll"}
-- For deleting one: {"action": "delete", "taskName": "..."}
-- For deleting ALL: {"action": "deleteAll"}
-- For updating when/date: {"action": "update", "taskName": "...", "when": "..."}
-- For chat: {"action": "chat", "message": "..."}
-- For ignoring (in groups): {"action": "ignore"}
-
-When user says something like "X würde ich Y machen" or "X auf Y verschieben", update the task's when field.
-When user says "lösche X" or "delete X", delete that specific task.
-${isGroup ? 'In group chats, respond with {"action": "ignore"} for general conversation that is not task-related.' : ''}` 
+          content: `Du bist ein hilfreicher Aufgaben-Bot. Du antwortest IMMER - entweder mit einer Aktion oder einem hilfreichen Kommentar. Antworte auf Deutsch.`
         },
-        { role: 'user', content: context }
+        { 
+          role: 'user', 
+          content: `Aktuelle Aufgaben: ${activeTasks.map(t => `"${t.task}" (Ort: ${t.location || 'überall'}, Wann: ${t.when || 'flexibel'})`).join(', ')}\n\nUser sagt: "${text}"`
+        }
       ],
-      temperature: 0.3,
-      response_format: { type: "json_object" }
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'show_tasks',
+            description: 'Zeige alle Aufgaben'
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'add_task',
+            description: 'Füge eine neue Aufgabe hinzu',
+            parameters: {
+              type: 'object',
+              properties: {
+                task: { type: 'string', description: 'Aufgabenbeschreibung' },
+                location: { type: 'string', description: 'Ort (optional)' },
+                when: { type: 'string', description: 'Wann (z.B. morgen, Montag, 2025-07-15)' },
+                category: { 
+                  type: 'string', 
+                  enum: ['shopping', 'household', 'personal', 'work', 'general'],
+                  description: 'Kategorie'
+                }
+              },
+              required: ['task']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'complete_task',
+            description: 'Markiere eine Aufgabe als erledigt',
+            parameters: {
+              type: 'object',
+              properties: {
+                taskName: { type: 'string', description: 'Name der Aufgabe' }
+              },
+              required: ['taskName']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'complete_all_tasks',
+            description: 'Markiere ALLE Aufgaben als erledigt'
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'delete_task',
+            description: 'Lösche eine Aufgabe',
+            parameters: {
+              type: 'object',
+              properties: {
+                taskName: { type: 'string', description: 'Name der Aufgabe' }
+              },
+              required: ['taskName']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'delete_all_tasks',
+            description: 'Lösche ALLE Aufgaben'
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'update_task_date',
+            description: 'Ändere das Datum einer Aufgabe',
+            parameters: {
+              type: 'object',
+              properties: {
+                taskName: { type: 'string', description: 'Name der Aufgabe' },
+                when: { type: 'string', description: 'Neues Datum' }
+              },
+              required: ['taskName', 'when']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'suggest_tasks',
+            description: 'Schlage passende Aufgaben vor basierend auf verfügbarer Zeit und/oder Ort',
+            parameters: {
+              type: 'object',
+              properties: {
+                time_available: { type: 'string', description: 'Verfügbare Zeit (z.B. "10 Minuten", "1 Stunde")' },
+                location: { type: 'string', description: 'Aktueller Ort (z.B. "zuhause", "unterwegs", "Büro")' }
+              }
+            }
+          }
+        }
+      ],
+      tool_choice: 'auto',
+      temperature: 0.3
     });
     
-    const result = JSON.parse(completion.choices[0].message.content);
-    console.log('AI result:', result);
+    const message = completion.choices[0].message;
     
-    if (result.action === 'ignore') {
-      return null;
+    // Handle tool calls
+    if (message.tool_calls) {
+      for (const toolCall of message.tool_calls) {
+        const functionName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments);
+        
+        console.log(`Tool call: ${functionName}`, args);
+        
+        switch (functionName) {
+          case 'show_tasks':
+            return formatTaskList(tasks);
+            
+          case 'add_task':
+            const count = await addTasks([args], userName);
+            return count > 0 ? `✅ Aufgabe hinzugefügt: "${args.task}"` : 'Diese Aufgabe existiert schon';
+            
+          case 'complete_task':
+            const completed = await completeTask(args.taskName);
+            return completed ? `✅ "${completed}" erledigt!` : `Nicht gefunden: "${args.taskName}"`;
+            
+          case 'complete_all_tasks':
+            const allCompleted = await completeAllTasks();
+            return allCompleted > 0 ? `✅ Alle ${allCompleted} Aufgaben erledigt!` : 'Keine aktiven Aufgaben';
+            
+          case 'delete_task':
+            const deleted = await deleteTask(args.taskName);
+            return deleted ? `🗑️ "${deleted}" gelöscht!` : `Nicht gefunden: "${args.taskName}"`;
+            
+          case 'delete_all_tasks':
+            const allDeleted = await deleteAllTasks();
+            return allDeleted > 0 ? `🗑️ Alle ${allDeleted} Aufgaben gelöscht!` : 'Keine aktiven Aufgaben';
+            
+          case 'update_task_date':
+            const updated = await updateTask(args.taskName, { when: args.when });
+            return updated ? `✅ "${args.taskName}" verschoben auf ${parseDate(args.when)}` : `Nicht gefunden: "${args.taskName}"`;
+            
+          case 'suggest_tasks':
+            return suggestTasks(tasks, args.time_available, args.location);
+        }
+      }
     }
     
-    if (result.action === 'show') {
-      return formatTaskList(tasks);
-    }
+    // Always return something - either tool result or message content
+    return message.content || 'Ich bin mir nicht sicher, was du meinst. Kannst du es anders formulieren?';
     
-    if (result.action === 'add' && result.tasks) {
-      const count = await addTasks(result.tasks, userName);
-      return count > 0 ? `✅ ${count} neue Aufgaben hinzugefügt` : 'Diese Aufgaben existieren schon';
-    }
-    
-    if (result.action === 'complete' && result.taskName) {
-      const completed = await completeTask(result.taskName);
-      return completed ? `✅ "${completed}" erledigt!` : `Nicht gefunden: "${result.taskName}"`;
-    }
-    
-    if (result.action === 'completeAll') {
-      const count = await completeAllTasks();
-      return count > 0 ? `✅ Alle ${count} Aufgaben erledigt!` : 'Keine aktiven Aufgaben';
-    }
-    
-    if (result.action === 'update' && result.taskName) {
-      const success = await updateTask(result.taskName, { when: result.when });
-      return success ? `✅ "${result.taskName}" verschoben auf ${result.when}` : `Nicht gefunden: "${result.taskName}"`;
-    }
-    
-    if (result.action === 'delete' && result.taskName) {
-      const deleted = await deleteTask(result.taskName);
-      return deleted ? `🗑️ "${deleted}" gelöscht!` : `Nicht gefunden: "${result.taskName}"`;
-    }
-    
-    if (result.action === 'deleteAll') {
-      const count = await deleteAllTasks();
-      return count > 0 ? `🗑️ Alle ${count} Aufgaben gelöscht!` : 'Keine aktiven Aufgaben';
-    }
-    
-    if (result.action === 'chat' && result.message) {
-      return result.message;
-    }
-    
-    return null;
   } catch (error) {
     console.error('AI Error:', error.message);
     return null;
   }
+}
+
+// Suggest tasks based on time and location
+function suggestTasks(tasks, timeAvailable, location) {
+  const active = tasks.filter(t => t.status !== 'done');
+  
+  if (active.length === 0) {
+    return '🎉 Super! Du hast keine offenen Aufgaben!';
+  }
+  
+  // Parse time to minutes
+  let minutes = 0;
+  if (timeAvailable) {
+    const timeMatch = timeAvailable.match(/(\d+)\s*(minute|minuten|stunde|stunden|hour)/i);
+    if (timeMatch) {
+      const value = parseInt(timeMatch[1]);
+      const unit = timeMatch[2].toLowerCase();
+      if (unit.includes('stunde') || unit.includes('hour')) {
+        minutes = value * 60;
+      } else {
+        minutes = value;
+      }
+    }
+  }
+  
+  // Filter tasks by location and estimated time
+  let suggested = active;
+  
+  // Location filtering
+  if (location) {
+    const locationLower = location.toLowerCase();
+    if (locationLower.includes('zuhause') || locationLower.includes('home')) {
+      suggested = suggested.filter(t => 
+        !t.location || 
+        t.location.toLowerCase().includes('zuhause') ||
+        t.category === 'household'
+      );
+    } else if (locationLower.includes('unterwegs') || locationLower.includes('draußen')) {
+      suggested = suggested.filter(t => 
+        t.location && !t.location.toLowerCase().includes('zuhause') ||
+        t.category === 'shopping'
+      );
+    }
+  }
+  
+  // Time filtering - quick tasks for short time
+  if (minutes > 0 && minutes <= 15) {
+    // Prioritize quick tasks
+    const quickTasks = ['geschirrspüler', 'müll', 'aufräumen', 'saugroboter'];
+    suggested = suggested.filter(t => 
+      quickTasks.some(quick => t.task.toLowerCase().includes(quick))
+    );
+  } else if (minutes > 15 && minutes <= 30) {
+    // Medium tasks
+    const mediumTasks = ['saugen', 'bad', 'küche', 'einkaufen'];
+    suggested = suggested.filter(t => 
+      mediumTasks.some(medium => t.task.toLowerCase().includes(medium))
+    );
+  }
+  
+  // Build response
+  if (suggested.length === 0) {
+    return `Hmm, ich finde keine passenden Aufgaben für ${timeAvailable || ''} ${location || ''}. Hier sind alle deine Aufgaben:\n\n${formatTaskList(tasks)}`;
+  }
+  
+  let response = `💡 Vorschläge für ${timeAvailable || ''} ${location || ''}:\n\n`;
+  
+  suggested.forEach(t => {
+    response += `• ${t.task}`;
+    if (t.location) response += ` @${t.location}`;
+    response += '\n';
+  });
+  
+  if (suggested.length < active.length) {
+    response += `\n(${active.length - suggested.length} weitere Aufgaben vorhanden)`;
+  }
+  
+  return response;
 }
 
 // Message handler
@@ -470,9 +636,6 @@ Sag einfach was du brauchst:
       const aiResponse = await handleAI(text, tasks, userName, isGroup && !isMentioned);
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
-        return;
-      } else if (isGroup && !isMentioned) {
-        // In group, AI decided to ignore this message (and bot wasn't mentioned)
         return;
       }
     }
