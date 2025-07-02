@@ -337,11 +337,17 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4.1',
       messages: [
         { 
           role: 'system', 
-          content: `Du bist ein hilfreicher Aufgaben-Bot. Du antwortest IMMER - entweder mit einer Aktion oder einem hilfreichen Kommentar. Antworte auf Deutsch.`
+          content: `Du bist ein hilfreicher Aufgaben-Bot. Du antwortest IMMER auf jede Nachricht. 
+          
+WICHTIG: Wenn der User mehrere Aufgaben in einer Nachricht erwähnt (durch Kommas, "und", oder neue Sätze getrennt), erkenne ALLE Aufgaben und füge sie einzeln hinzu.
+
+Beispiel: "Ich muss einkaufen, Bad putzen und Müll rausbringen" = 3 separate Aufgaben
+
+Antworte auf Deutsch.`
         },
         { 
           role: 'user', 
@@ -359,21 +365,31 @@ async function handleAI(text, tasks, userName, isGroup = false) {
         {
           type: 'function',
           function: {
-            name: 'add_task',
-            description: 'Füge eine neue Aufgabe hinzu',
+            name: 'add_tasks',
+            description: 'Füge eine oder mehrere neue Aufgaben hinzu',
             parameters: {
               type: 'object',
               properties: {
-                task: { type: 'string', description: 'Aufgabenbeschreibung' },
-                location: { type: 'string', description: 'Ort (optional)' },
-                when: { type: 'string', description: 'Wann (z.B. morgen, Montag, 2025-07-15)' },
-                category: { 
-                  type: 'string', 
-                  enum: ['shopping', 'household', 'personal', 'work', 'general'],
-                  description: 'Kategorie'
+                tasks: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      task: { type: 'string', description: 'Aufgabenbeschreibung' },
+                      location: { type: 'string', description: 'Ort (optional)' },
+                      when: { type: 'string', description: 'Wann (z.B. morgen, Montag)' },
+                      category: { 
+                        type: 'string', 
+                        enum: ['shopping', 'household', 'personal', 'work', 'general'],
+                        description: 'Kategorie'
+                      }
+                    },
+                    required: ['task']
+                  },
+                  description: 'Liste von Aufgaben'
                 }
               },
-              required: ['task']
+              required: ['tasks']
             }
           }
         },
@@ -467,9 +483,15 @@ async function handleAI(text, tasks, userName, isGroup = false) {
           case 'show_tasks':
             return formatTaskList(tasks);
             
-          case 'add_task':
-            const count = await addTasks([args], userName);
-            return count > 0 ? `✅ Aufgabe hinzugefügt: "${args.task}"` : 'Diese Aufgabe existiert schon';
+          case 'add_tasks':
+            const count = await addTasks(args.tasks, userName);
+            if (count === 1) {
+              return `✅ Aufgabe hinzugefügt: "${args.tasks[0].task}"`;
+            } else if (count > 1) {
+              return `✅ ${count} Aufgaben hinzugefügt!`;
+            } else {
+              return 'Diese Aufgaben existieren schon';
+            }
             
           case 'complete_task':
             const completed = await completeTask(args.taskName);
@@ -633,7 +655,7 @@ Sag einfach was du brauchst:
     
     // Try AI first
     if (openai) {
-      const aiResponse = await handleAI(text, tasks, userName, isGroup && !isMentioned);
+      const aiResponse = await handleAI(text, tasks, userName, false); // Always respond, don't check group status
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
         return;
