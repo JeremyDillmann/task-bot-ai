@@ -405,6 +405,17 @@ bot.on('message', async (msg) => {
   
   const userName = msg.from.first_name || 'User';
   const isGroup = msg.chat.type !== 'private';
+  let isMentioned = false;
+  
+  // Check if bot is mentioned
+  if (isGroup) {
+    const botUsername = (await bot.getMe()).username;
+    isMentioned = text.includes(`@${botUsername}`);
+    if (isMentioned) {
+      // Remove bot mention from text for cleaner processing
+      text = text.replace(`@${botUsername}`, '').trim();
+    }
+  }
   
   console.log(`Message from ${userName} in ${isGroup ? 'group' : 'private'}: ${text}`);
   
@@ -434,12 +445,12 @@ Sag einfach was du brauchst:
     
     // Try AI first
     if (openai) {
-      const aiResponse = await handleAI(text, tasks, userName, isGroup);
+      const aiResponse = await handleAI(text, tasks, userName, isGroup && !isMentioned);
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
         return;
-      } else if (isGroup) {
-        // In group, AI decided to ignore this message
+      } else if (isGroup && !isMentioned) {
+        // In group, AI decided to ignore this message (and bot wasn't mentioned)
         return;
       }
     }
