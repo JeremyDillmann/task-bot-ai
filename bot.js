@@ -1,4 +1,38 @@
-// bot.js - Full version with AI and task assignment
+// Undo last action
+async function undoLastAction() {
+  if (!lastAction.type) {
+    return 'Nichts zum Rückgängigmachen.';
+  }
+  
+  const timeSince = Date.now() - lastAction.timestamp;
+  if (timeSince > 300000) { // 5 minutes
+    return 'Die letzte Aktion ist zu alt zum Rückgängigmachen (über 5 Minuten).';
+  }
+  
+  switch (lastAction.type) {
+    case 'add':
+      // Delete the tasks that were just added
+      let deleted = 0;
+      for (const taskName of lastAction.tasks) {
+        if (await deleteTask(taskName)) {
+          deleted++;
+        }
+      }
+      lastAction = { type: null, tasks: [], timestamp: null };
+      return `✅ ${deleted} Aufgaben rückgängig gemacht.`;
+      
+    case 'delete':
+      // Can't undo delete easily, but inform user
+      return '❌ Gelöschte Aufgaben können nicht wiederhergestellt werden.';
+      
+    case 'complete':
+      // Could implement uncomplete, but for now just inform
+      return '❌ Erledigte Aufgaben können nicht rückgängig gemacht werden.';
+      
+    default:
+      return 'Nichts zum Rückgängigmachen.';
+  }
+}// bot.js - Full version with AI and task assignment
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -118,11 +152,19 @@ async function getAllTasks() {
   }
 }
 
+// Track last action for undo
+let lastAction = {
+  type: null,  // 'add', 'delete', 'complete'
+  tasks: [],   // task names or row numbers
+  timestamp: null
+};
+
 // Add tasks with date parsing and person assignment
 async function addTasks(tasks, userName) {
   const existingTasks = await getAllTasks();
   const date = new Date().toISOString().split('T')[0];
   const newTasks = [];
+  const addedTaskNames = [];
   
   for (const task of tasks) {
     const exists = existingTasks.some(existing => 
@@ -140,6 +182,7 @@ async function addTasks(tasks, userName) {
         task.category || 'general',
         'pending'
       ]);
+      addedTaskNames.push(task.task);
     }
   }
   
@@ -150,6 +193,13 @@ async function addTasks(tasks, userName) {
       valueInputOption: 'RAW',
       resource: { values: newTasks }
     });
+    
+    // Track for undo
+    lastAction = {
+      type: 'add',
+      tasks: addedTaskNames,
+      timestamp: new Date()
+    };
   }
   
   return newTasks.length;
@@ -252,13 +302,23 @@ async function deleteAllTasks() {
   activeTasks.sort((a, b) => b.row - a.row);
   
   let deleted = 0;
+  const deletedNames = [];
+  
   for (const task of activeTasks) {
     await sheets.spreadsheets.values.clear({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `A${task.row}:G${task.row}`,
     });
+    deletedNames.push(task.task);
     deleted++;
   }
+  
+  // Track for undo (though we can't restore deleted tasks)
+  lastAction = {
+    type: 'delete',
+    tasks: deletedNames,
+    timestamp: new Date()
+  };
   
   return deleted;
 }
@@ -349,7 +409,7 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: 'gpt-4.1',  // Use the newer model for better understanding
       messages: [
         { 
           role: 'system', 
@@ -359,11 +419,21 @@ WICHTIG:
 1. Wenn der User mehrere Aufgaben in einer Nachricht erwähnt (durch Kommas, "und", oder neue Sätze getrennt), erkenne ALLE Aufgaben und füge sie einzeln hinzu.
 2. Wenn jemand sagt "[Person] muss/soll [Aufgabe]", dann weise die Aufgabe dieser Person zu (assignedTo).
 3. Wenn keine Person genannt wird, verwende den Absender als Standard.
+4. ORTE ERKENNEN: Bei Mustern wie "[Ort] - [Artikel]" oder "[Ort]: [Artikel]" ist der erste Teil der Ort!
+5. RÜCKGÄNGIG: Bei "falsch", "rückgängig", "undo", "löschen" (im Kontext von gerade hinzugefügten Aufgaben) nutze die undo Funktion.
 
-Beispiele:
-- "Moana muss den Müll rausbringen" = Aufgabe "Müll rausbringen" für Moana
-- "Jeremy soll einkaufen" = Aufgabe "einkaufen" für Jeremy
-- "Ich muss putzen" = Aufgabe "putzen" für den Absender
+Beispiele für Orte:
+- "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
+- "Hofpfisterei - Roggenbrot" = Aufgabe "Roggenbrot" mit location "Hofpfisterei"  
+- "DM - Shampoo" = Aufgabe "Shampoo" mit location "DM"
+- "Apotheke: Aspirin" = Aufgabe "Aspirin" mit location "Apotheke"
+- "Müll rausbringen" = Aufgabe "Müll rausbringen" ohne location
+- "Bei Aldi Milch holen" = Aufgabe "Milch holen" mit location "Aldi"
+
+Bekannte Orte in Deutschland: Edeka, Rewe, Aldi, Lidl, Penny, Netto, DM, Rossmann, Müller, Hofpfisterei, Apotheke, etc.
+Diese Orte sind IMMER shopping Kategorie!
+
+UNDO: Bei "falsch", "rückgängig", "undo" nutze die undo Funktion statt alles zu löschen!
 
 Antworte auf Deutsch.`
         },
@@ -503,6 +573,17 @@ Antworte auf Deutsch.`
               required: ['taskName', 'person']
             }
           }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'undo',
+            description: 'Mache die letzte Aktion rückgängig (nur für kürzlich hinzugefügte Aufgaben)',
+            parameters: {
+              type: 'object',
+              properties: {}
+            }
+          }
         }
       ],
       tool_choice: 'auto',
@@ -561,6 +642,10 @@ Antworte auf Deutsch.`
           case 'assign_task':
             const assigned = await updateTask(args.taskName, { person: args.person });
             return assigned ? `✅ "${args.taskName}" wurde ${args.person} zugewiesen` : `Nicht gefunden: "${args.taskName}"`;
+            
+          case 'undo':
+            return await undoLastAction();
+        }
         }
       }
     }
@@ -707,6 +792,12 @@ Sag einfach was du brauchst:
     }
     
     // Fallback patterns if AI fails
+    if (text.match(/rückgängig|undo|falsch.*lösch/i)) {
+      const result = await undoLastAction();
+      await bot.sendMessage(chatId, result);
+      return;
+    }
+    
     if (text.match(/aufgabe|liste|zeige|was muss/i)) {
       // Check if asking for specific person's tasks
       const personMatch = text.match(/(moana|jeremy|ich|meine)/i);
