@@ -1,4 +1,32 @@
-// bot.js - Full version with AI
+// Remove duplicates
+async function removeDuplicates() {
+  const tasks = await getAllTasks();
+  const seen = new Map();
+  const toDelete = [];
+  
+  tasks.forEach(task => {
+    if (task.status === 'done') return;
+    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
+    
+    if (seen.has(key)) {
+      toDelete.push(task.row);
+    } else {
+      seen.set(key, task);
+    }
+  });
+  
+  toDelete.sort((a, b) => b - a);
+  
+  for (const row of toDelete) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `A${row}:G${row}`,
+    });
+  }
+  
+  return toDelete.length;
+}- For deleting one: {"action": "delete", "taskName": "..."}
+- For deleting ALL: {"action": "deleteAll"}// bot.js - Full version with AI
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -75,7 +103,50 @@ async function getAllTasks() {
   }
 }
 
-// Add tasks
+// Helper to parse dates
+function parseDate(dateStr) {
+  const today = new Date();
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  
+  const dayMap = {
+    'heute': today,
+    'today': today,
+    'morgen': tomorrow,
+    'tomorrow': tomorrow,
+    'montag': getNextWeekday(1),
+    'dienstag': getNextWeekday(2),
+    'mittwoch': getNextWeekday(3),
+    'donnerstag': getNextWeekday(4),
+    'freitag': getNextWeekday(5),
+    'samstag': getNextWeekday(6),
+    'sonntag': getNextWeekday(0)
+  };
+  
+  const lower = dateStr?.toLowerCase() || '';
+  if (dayMap[lower]) {
+    return dayMap[lower].toISOString().split('T')[0];
+  }
+  
+  // Try to parse as date
+  const parsed = new Date(dateStr);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().split('T')[0];
+  }
+  
+  return dateStr; // Return original if can't parse
+}
+
+function getNextWeekday(dayOfWeek) {
+  const today = new Date();
+  const todayDay = today.getDay();
+  const daysUntil = (dayOfWeek - todayDay + 7) % 7 || 7;
+  const result = new Date(today);
+  result.setDate(today.getDate() + daysUntil);
+  return result;
+}
+
+// Add tasks with date parsing
 async function addTasks(tasks, userName) {
   const existingTasks = await getAllTasks();
   const date = new Date().toISOString().split('T')[0];
@@ -93,7 +164,7 @@ async function addTasks(tasks, userName) {
         userName,
         task.task,
         task.location || '',
-        task.when || '',
+        parseDate(task.when) || '',  // Parse dates here
         task.category || 'general',
         'pending'
       ]);
@@ -126,7 +197,7 @@ async function updateTask(taskName, updates) {
       task.person,
       updates.task || task.task,
       updates.location || task.location,
-      updates.when || task.when,
+      parseDate(updates.when) || task.when,  // Parse dates here
       updates.category || task.category,
       task.status
     ];
@@ -162,33 +233,42 @@ async function completeAllTasks() {
   return completed;
 }
 
-// Remove duplicates
-async function removeDuplicates() {
+// Delete task
+async function deleteTask(taskName) {
   const tasks = await getAllTasks();
-  const seen = new Map();
-  const toDelete = [];
+  const task = tasks.find(t => 
+    t.task.toLowerCase().includes(taskName.toLowerCase()) && 
+    t.status !== 'done'
+  );
   
-  tasks.forEach(task => {
-    if (task.status === 'done') return;
-    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
-    
-    if (seen.has(key)) {
-      toDelete.push(task.row);
-    } else {
-      seen.set(key, task);
-    }
-  });
-  
-  toDelete.sort((a, b) => b - a);
-  
-  for (const row of toDelete) {
+  if (task) {
     await sheets.spreadsheets.values.clear({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: `A${row}:G${row}`,
+      range: `A${task.row}:G${task.row}`,
     });
+    return task.task;
+  }
+  return null;
+}
+
+// Delete all tasks
+async function deleteAllTasks() {
+  const tasks = await getAllTasks();
+  const activeTasks = tasks.filter(t => t.status !== 'done');
+  
+  // Sort by row number descending to avoid index issues
+  activeTasks.sort((a, b) => b.row - a.row);
+  
+  let deleted = 0;
+  for (const task of activeTasks) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `A${task.row}:G${task.row}`,
+    });
+    deleted++;
   }
   
-  return toDelete.length;
+  return deleted;
 }
 
 // Format task list
@@ -229,13 +309,14 @@ function formatTaskList(tasks) {
 }
 
 // AI handler
-async function handleAI(text, tasks, userName) {
+async function handleAI(text, tasks, userName, isGroup = false) {
   if (!openai) return null;
   
   try {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     const context = `Current tasks: ${activeTasks.map(t => t.task).join(', ')}
 User says: "${text}"
+${isGroup ? 'This is in a group chat. Only respond if the message is clearly task-related or addressing the bot.' : ''}
 Determine what action to take. Reply in German.`;
 
     const completion = await openai.chat.completions.create({
@@ -248,10 +329,15 @@ Determine what action to take. Reply in German.`;
 - For adding: {"action": "add", "tasks": [{"task": "...", "location": "...", "when": "...", "category": "shopping|household|personal|work|general"}]}
 - For completing: {"action": "complete", "taskName": "..."}
 - For completing ALL: {"action": "completeAll"}
+- For deleting one: {"action": "delete", "taskName": "..."}
+- For deleting ALL: {"action": "deleteAll"}
 - For updating when/date: {"action": "update", "taskName": "...", "when": "..."}
 - For chat: {"action": "chat", "message": "..."}
+- For ignoring (in groups): {"action": "ignore"}
 
-When user says something like "X würde ich Y machen" or "X auf Y verschieben", update the task's when field.` 
+When user says something like "X würde ich Y machen" or "X auf Y verschieben", update the task's when field.
+When user says "lösche X" or "delete X", delete that specific task.
+${isGroup ? 'In group chats, respond with {"action": "ignore"} for general conversation that is not task-related.' : ''}` 
         },
         { role: 'user', content: context }
       ],
@@ -261,6 +347,10 @@ When user says something like "X würde ich Y machen" or "X auf Y verschieben", 
     
     const result = JSON.parse(completion.choices[0].message.content);
     console.log('AI result:', result);
+    
+    if (result.action === 'ignore') {
+      return null;
+    }
     
     if (result.action === 'show') {
       return formatTaskList(tasks);
@@ -286,6 +376,16 @@ When user says something like "X würde ich Y machen" or "X auf Y verschieben", 
       return success ? `✅ "${result.taskName}" verschoben auf ${result.when}` : `Nicht gefunden: "${result.taskName}"`;
     }
     
+    if (result.action === 'delete' && result.taskName) {
+      const deleted = await deleteTask(result.taskName);
+      return deleted ? `🗑️ "${deleted}" gelöscht!` : `Nicht gefunden: "${result.taskName}"`;
+    }
+    
+    if (result.action === 'deleteAll') {
+      const count = await deleteAllTasks();
+      return count > 0 ? `🗑️ Alle ${count} Aufgaben gelöscht!` : 'Keine aktiven Aufgaben';
+    }
+    
     if (result.action === 'chat' && result.message) {
       return result.message;
     }
@@ -304,7 +404,9 @@ bot.on('message', async (msg) => {
   if (!text) return;
   
   const userName = msg.from.first_name || 'User';
-  console.log(`Message from ${userName}: ${text}`);
+  const isGroup = msg.chat.type !== 'private';
+  
+  console.log(`Message from ${userName} in ${isGroup ? 'group' : 'private'}: ${text}`);
   
   try {
     // Remove duplicates first
@@ -332,9 +434,12 @@ Sag einfach was du brauchst:
     
     // Try AI first
     if (openai) {
-      const aiResponse = await handleAI(text, tasks, userName);
+      const aiResponse = await handleAI(text, tasks, userName, isGroup);
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
+        return;
+      } else if (isGroup) {
+        // In group, AI decided to ignore this message
         return;
       }
     }
