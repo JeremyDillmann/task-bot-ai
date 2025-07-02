@@ -133,10 +133,10 @@ async function addTasks(tasks, userName) {
     if (!exists) {
       newTasks.push([
         date,
-        userName,
+        task.assignedTo || userName,  // Use assigned person or default to creator
         task.task,
         task.location || '',
-        parseDate(task.when) || '',  // Parse dates here
+        parseDate(task.when) || '',
         task.category || 'general',
         'pending'
       ]);
@@ -186,10 +186,10 @@ async function updateTask(taskName, updates) {
   if (task) {
     const updatedRow = [
       task.date,
-      task.person,
+      updates.person || task.person,  // Can update person
       updates.task || task.task,
       updates.location || task.location,
-      parseDate(updates.when) || task.when,  // Parse dates here
+      parseDate(updates.when) || task.when,
       updates.category || task.category,
       task.status
     ];
@@ -293,19 +293,30 @@ async function removeDuplicates() {
 }
 
 // Format task list
-function formatTaskList(tasks) {
+function formatTaskList(tasks, filterPerson = null) {
   const active = tasks.filter(t => t.status !== 'done');
   
   if (active.length === 0) return 'Alles erledigt! 🎉';
   
+  // Filter by person if specified
+  const filtered = filterPerson 
+    ? active.filter(t => t.person.toLowerCase() === filterPerson.toLowerCase())
+    : active;
+  
+  if (filterPerson && filtered.length === 0) {
+    return `Keine Aufgaben für ${filterPerson} gefunden.`;
+  }
+  
   const byCategory = {};
-  active.forEach(t => {
+  filtered.forEach(t => {
     const cat = t.category || 'general';
     if (!byCategory[cat]) byCategory[cat] = [];
     byCategory[cat].push(t);
   });
   
-  let response = `📋 Du hast ${active.length} Aufgaben:\n\n`;
+  let response = filterPerson 
+    ? `📋 ${filterPerson}'s Aufgaben (${filtered.length}):\n\n`
+    : `📋 Alle Aufgaben (${filtered.length}):\n\n`;
   
   Object.entries(byCategory).forEach(([cat, tasks]) => {
     const emoji = {
@@ -319,6 +330,7 @@ function formatTaskList(tasks) {
     response += `${emoji} ${cat.toUpperCase()}:\n`;
     tasks.forEach(t => {
       response += `• ${t.task}`;
+      if (t.person && !filterPerson) response += ` (${t.person})`;
       if (t.location) response += ` @${t.location}`;
       if (t.when) response += ` (${t.when})`;
       response += '\n';
@@ -343,15 +355,35 @@ async function handleAI(text, tasks, userName, isGroup = false) {
           role: 'system', 
           content: `Du bist ein hilfreicher Aufgaben-Bot. Du antwortest IMMER auf jede Nachricht. 
           
-WICHTIG: Wenn der User mehrere Aufgaben in einer Nachricht erwähnt (durch Kommas, "und", oder neue Sätze getrennt), erkenne ALLE Aufgaben und füge sie einzeln hinzu.
+WICHTIG: 
+1. Wenn der User mehrere Aufgaben in einer Nachricht erwähnt (durch Kommas, "und", oder neue Sätze getrennt), erkenne ALLE Aufgaben und füge sie einzeln hinzu.
+2. Wenn jemand sagt "[Person] muss/soll [Aufgabe]", dann weise die Aufgabe dieser Person zu (assignedTo).
+3. Wenn keine Person genannt wird, verwende den Absender als Standard.
 
-Beispiel: "Ich muss einkaufen, Bad putzen und Müll rausbringen" = 3 separate Aufgaben
+Beispiele:
+- "Moana muss den Müll rausbringen" = Aufgabe "Müll rausbringen" für Moana
+- "Jeremy soll einkaufen" = Aufgabe "einkaufen" für Jeremy
+- "Ich muss putzen" = Aufgabe "putzen" für den Absender
 
 Antworte auf Deutsch.`
+        {
+          type: 'function',
+          function: {
+            name: 'assign_task',
+            description: 'Weise eine existierende Aufgabe einer Person zu',
+            parameters: {
+              type: 'object',
+              properties: {
+                taskName: { type: 'string', description: 'Name der Aufgabe' },
+                person: { type: 'string', description: 'Person, der die Aufgabe zugewiesen wird' }
+              },
+              required: ['taskName', 'person']
+            }
+          }
         },
         { 
           role: 'user', 
-          content: `Aktuelle Aufgaben: ${activeTasks.map(t => `"${t.task}" (Ort: ${t.location || 'überall'}, Wann: ${t.when || 'flexibel'})`).join(', ')}\n\nUser sagt: "${text}"`
+          content: `Aktuelle Aufgaben: ${activeTasks.map(t => `"${t.task}" (Person: ${t.person || 'niemand'}, Ort: ${t.location || 'überall'}, Wann: ${t.when || 'flexibel'})`).join(', ')}\n\nUser (${userName}) sagt: "${text}"`
         }
       ],
       tools: [
@@ -359,7 +391,13 @@ Antworte auf Deutsch.`
           type: 'function',
           function: {
             name: 'show_tasks',
-            description: 'Zeige alle Aufgaben'
+            description: 'Zeige alle Aufgaben oder Aufgaben einer bestimmten Person',
+            parameters: {
+              type: 'object',
+              properties: {
+                person: { type: 'string', description: 'Filter nach Person (optional)' }
+              }
+            }
           }
         },
         {
@@ -481,12 +519,14 @@ Antworte auf Deutsch.`
         
         switch (functionName) {
           case 'show_tasks':
-            return formatTaskList(tasks);
+            return formatTaskList(tasks, args.person);
             
           case 'add_tasks':
             const count = await addTasks(args.tasks, userName);
             if (count === 1) {
-              return `✅ Aufgabe hinzugefügt: "${args.tasks[0].task}"`;
+              const task = args.tasks[0];
+              const assignee = task.assignedTo || userName;
+              return `✅ Aufgabe für ${assignee} hinzugefügt: "${task.task}"`;
             } else if (count > 1) {
               return `✅ ${count} Aufgaben hinzugefügt!`;
             } else {
@@ -515,6 +555,10 @@ Antworte auf Deutsch.`
             
           case 'suggest_tasks':
             return suggestTasks(tasks, args.time_available, args.location);
+            
+          case 'assign_task':
+            const assigned = await updateTask(args.taskName, { person: args.person });
+            return assigned ? `✅ "${args.taskName}" wurde ${args.person} zugewiesen` : `Nicht gefunden: "${args.taskName}"`;
         }
       }
     }
@@ -595,6 +639,7 @@ function suggestTasks(tasks, timeAvailable, location) {
   
   suggested.forEach(t => {
     response += `• ${t.task}`;
+    if (t.person) response += ` (${t.person})`;
     if (t.location) response += ` @${t.location}`;
     response += '\n';
   });
@@ -664,7 +709,20 @@ Sag einfach was du brauchst:
     
     // Fallback patterns if AI fails
     if (text.match(/aufgabe|liste|zeige|was muss/i)) {
-      await bot.sendMessage(chatId, formatTaskList(tasks));
+      // Check if asking for specific person's tasks
+      const personMatch = text.match(/(moana|jeremy|ich|meine)/i);
+      let filterPerson = null;
+      
+      if (personMatch) {
+        const person = personMatch[1].toLowerCase();
+        if (person === 'ich' || person === 'meine') {
+          filterPerson = userName;
+        } else {
+          filterPerson = person.charAt(0).toUpperCase() + person.slice(1);
+        }
+      }
+      
+      await bot.sendMessage(chatId, formatTaskList(tasks, filterPerson));
       return;
     }
     
