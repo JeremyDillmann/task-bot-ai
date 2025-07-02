@@ -349,7 +349,7 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4.1',
       messages: [
         { 
           role: 'system', 
