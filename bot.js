@@ -134,7 +134,7 @@ function getNextWeekday(dayOfWeek) {
   return result;
 }
 
-// Get all tasks with error handling
+// Get all tasks with better empty row handling
 async function getAllTasks() {
   if (!sheets) {
     console.error('Google Sheets not initialized');
@@ -144,27 +144,37 @@ async function getAllTasks() {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: 'A2:G',
+      range: 'A2:G1000', // Get more rows to ensure we don't miss any
     });
     
     const rows = response.data.values || [];
-    return rows.map((row, index) => ({
-      row: index + 2,
-      date: row[0] || '',
-      person: row[1] || '',
-      task: row[2] || '',
-      location: row[3] || '',
-      when: row[4] || '',
-      category: row[5] || 'general',
-      status: row[6] || 'pending'
-    }));
+    const tasks = [];
+    
+    // Process rows and skip empty ones
+    rows.forEach((row, index) => {
+      // Skip completely empty rows or rows with only partial data
+      if (row && row.length > 0 && (row[2] || '').trim() !== '') { // Check if task (column C) exists
+        tasks.push({
+          row: index + 2,
+          date: row[0] || '',
+          person: row[1] || '',
+          task: row[2] || '',
+          location: row[3] || '',
+          when: row[4] || '',
+          category: row[5] || 'general',
+          status: row[6] || 'pending'
+        });
+      }
+    });
+    
+    return tasks;
   } catch (error) {
     console.error('Sheets error:', error.message);
     return [];
   }
 }
 
-// Add tasks with better validation
+// Add tasks with better validation and proper sheets handling
 async function addTasks(tasks, userName) {
   if (!sheets) {
     throw new Error('Google Sheets nicht verfügbar');
@@ -217,12 +227,24 @@ async function addTasks(tasks, userName) {
   }
   
   if (newTasks.length > 0) {
-    await sheets.spreadsheets.values.append({
+    // Find the actual last row with data
+    let lastRow = 2; // Start after header
+    for (const task of existingTasks) {
+      if (task.row > lastRow) {
+        lastRow = task.row;
+      }
+    }
+    lastRow = lastRow + 1; // Next available row
+    
+    // Use update instead of append for more control
+    await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: 'A:G',
+      range: `A${lastRow}:G${lastRow + newTasks.length - 1}`,
       valueInputOption: 'RAW',
       resource: { values: newTasks }
     });
+    
+    console.log(`Added ${newTasks.length} tasks starting at row ${lastRow}`);
     
     // Track for undo
     lastAction = {
