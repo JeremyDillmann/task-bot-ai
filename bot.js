@@ -70,7 +70,7 @@ const SHARED_PERSON_VALUE = 'Beide'; // Standardized value for shared tasks
 
 // Helper to normalize person names
 function normalizePerson(person) {
-  if (!person) return '';
+  if (!person) return SHARED_PERSON_VALUE; // Default to shared
   const lower = person.toLowerCase().trim();
   
   // Check if it's a shared indicator
@@ -82,11 +82,19 @@ function normalizePerson(person) {
   const nameMap = {
     'moana': 'Moana',
     'jeremy': 'Jeremy',
-    'ich': null, // Will be replaced with userName
-    'meine': null, // Will be replaced with userName
+    'ich': null, // Will be replaced with userName in calling function
+    'meine': null, // Will be replaced with userName in calling function
+    'mir': null, // Will be replaced with userName in calling function
+    'mich': null, // Will be replaced with userName in calling function
   };
   
-  return nameMap[lower] !== undefined ? nameMap[lower] : person;
+  // If it's a known name, return the normalized version
+  if (nameMap.hasOwnProperty(lower)) {
+    return nameMap[lower];
+  }
+  
+  // If it's not recognized, return the original (could be a name we don't know)
+  return person;
 }
 
 // Helper to parse dates
@@ -189,10 +197,16 @@ async function addTasks(tasks, userName) {
     // Validate task
     if (!task.task || task.task.trim() === '') continue;
     
-    // Normalize person assignment
-    let assignedPerson = task.assignedTo || userName;
-    assignedPerson = normalizePerson(assignedPerson);
-    if (assignedPerson === null) assignedPerson = userName;
+    // DEFAULT TO "BEIDE" - Only use individual assignment if explicitly stated
+    let assignedPerson = SHARED_PERSON_VALUE; // Default to "Beide"
+    
+    if (task.assignedTo) {
+      const normalized = normalizePerson(task.assignedTo);
+      // Only assign to individual if it's not a shared indicator
+      if (normalized && normalized !== SHARED_PERSON_VALUE) {
+        assignedPerson = normalized === null ? userName : normalized;
+      }
+    }
     
     // Check for duplicates
     const exists = existingTasks.some(existing => 
@@ -204,7 +218,7 @@ async function addTasks(tasks, userName) {
     if (!exists) {
       // Ensure shared tasks have proper category
       let category = task.category || 'general';
-      if (assignedPerson === SHARED_PERSON_VALUE && category === 'general') {
+      if (assignedPerson === SHARED_PERSON_VALUE && (category === 'general' || !category)) {
         category = 'both';
       }
       
@@ -476,14 +490,15 @@ function formatTaskList(tasks, filterPerson = null) {
   
   // Filter by person if specified
   let filtered = active;
-  if (normalizedFilter) {
+  if (normalizedFilter && normalizedFilter !== SHARED_PERSON_VALUE) {
+    // When filtering by a specific person, include their tasks AND shared tasks
     filtered = active.filter(t => {
       const taskPerson = normalizePerson(t.person);
-      // Include personal tasks and shared tasks
-      return taskPerson === normalizedFilter || 
-             taskPerson === SHARED_PERSON_VALUE ||
-             (normalizedFilter === SHARED_PERSON_VALUE && taskPerson === SHARED_PERSON_VALUE);
+      return taskPerson === normalizedFilter || taskPerson === SHARED_PERSON_VALUE;
     });
+  } else if (normalizedFilter === SHARED_PERSON_VALUE) {
+    // When specifically asking for shared tasks, show only shared
+    filtered = active.filter(t => normalizePerson(t.person) === SHARED_PERSON_VALUE);
   }
   
   if (normalizedFilter && filtered.length === 0) {
@@ -500,8 +515,10 @@ function formatTaskList(tasks, filterPerson = null) {
   
   // Build response
   let response = '';
-  if (normalizedFilter) {
+  if (normalizedFilter && normalizedFilter !== SHARED_PERSON_VALUE) {
     response = `📋 ${filterPerson}'s Aufgaben (${filtered.length}):\n\n`;
+  } else if (normalizedFilter === SHARED_PERSON_VALUE) {
+    response = `👥 Gemeinsame Aufgaben (${filtered.length}):\n\n`;
   } else {
     response = `📋 Alle Aufgaben (${active.length}):\n\n`;
   }
@@ -534,7 +551,7 @@ function formatTaskList(tasks, filterPerson = null) {
       response += `• ${t.task}`;
       // Show person only if not filtered and not a shared task
       if (!normalizedFilter && t.person !== SHARED_PERSON_VALUE) {
-        response += ` (${t.person})`;
+        response += ` (nur ${t.person})`;
       }
       if (t.location) response += ` @${t.location}`;
       if (t.when) response += ` (${t.when})`;
@@ -554,34 +571,36 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4.1', // or 'gpt-4-turbo' for faster GPT-4
       messages: [
         { 
           role: 'system', 
           content: `Du bist ein hilfreicher Aufgaben-Bot für ein Paar (Moana und Jeremy). 
           
-KRITISCHE REGELN FÜR GEMEINSAME AUFGABEN:
-1. Wenn BEIDE Personen zusammen erwähnt werden (z.B. "Moana & Jeremy", "für beide", "wir müssen"), dann:
-   - ALLE nachfolgenden Aufgaben sind gemeinsam
-   - Setze assignedTo auf "Beide" (NICHT "Both", immer "Beide")
-   - Setze category auf "both"
-   - Dies gilt bis eine andere Person explizit genannt wird
+WICHTIGSTE REGEL: ALLE AUFGABEN SIND STANDARDMÄSSIG FÜR BEIDE!
 
-2. Erkenne diese Muster als gemeinsame Aufgaben:
-   - "Moana & Jeremy haben folgende Aufgaben: X, Y, Z" → ALLE sind gemeinsam
-   - "Wir müssen noch..." → gemeinsam
-   - "Für beide: ..." → gemeinsam
-   - "Gemeinsame Aufgaben: ..." → gemeinsam
-   - Wenn jemand nach "Aufgaben für beide" fragt → das ist KEINE neue Aufgabe, sondern eine Frage!
+KRITISCHE REGELN:
+1. DEFAULT = BEIDE: Jede Aufgabe ist automatisch für beide, es sei denn:
+   - Jemand sagt explizit "ich muss", "für mich", "meine Aufgabe"
+   - Eine spezifische Person wird genannt: "Jeremy muss", "Moana soll", "für Jeremy"
+   
+2. Diese Aufgaben sind FÜR BEIDE (Standard):
+   - "Müll rausbringen" → assignedTo: "Beide", category: "both"
+   - "Edeka - Milch" → assignedTo: "Beide", category: "shopping"
+   - "Wohnung putzen" → assignedTo: "Beide", category: "both"
+   - "Geschenke kaufen" → assignedTo: "Beide", category: "both"
 
-3. Einzelne Personen:
-   - "Jeremy muss X" → nur für Jeremy
-   - "Moana soll Y" → nur für Moana
-   - Wenn keine Person genannt → verwende den Absender (${userName})
+3. Diese Aufgaben sind NUR für eine Person:
+   - "Ich muss zum Arzt" → assignedTo: "${userName}"
+   - "Für mich: Haare schneiden" → assignedTo: "${userName}"
+   - "Jeremy muss zum Zahnarzt" → assignedTo: "Jeremy"
+   - "Moana soll Yoga machen" → assignedTo: "Moana"
 
-4. WICHTIG: "und aufgaben für beide?" ist eine FRAGE, keine neue Aufgabe!
+4. WICHTIG: Bei Aufgaben ohne Personenbezug → IMMER "Beide"!
 
 5. Orte erkennen: "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
+
+6. "und aufgaben für beide?" ist eine FRAGE, keine neue Aufgabe!
 
 Antworte immer auf Deutsch und sei freundlich.`
         },
@@ -611,7 +630,7 @@ Antworte immer auf Deutsch und sei freundlich.`
           type: 'function',
           function: {
             name: 'add_tasks',
-            description: 'Füge neue Aufgaben hinzu',
+            description: 'Füge neue Aufgaben hinzu (Standard: für beide)',
             parameters: {
               type: 'object',
               properties: {
@@ -630,7 +649,7 @@ Antworte immer auf Deutsch und sei freundlich.`
                       },
                       assignedTo: { 
                         type: 'string', 
-                        description: 'Person: "Jeremy", "Moana", oder "Beide" für gemeinsame'
+                        description: 'Person: "Jeremy", "Moana", oder "Beide" (Standard ist "Beide")'
                       }
                     },
                     required: ['task']
@@ -807,14 +826,16 @@ bot.on('message', async (msg) => {
       await bot.sendMessage(chatId, 
 `Hallo! Ich bin euer Aufgaben-Bot 🤖
 
+Alle Aufgaben sind standardmäßig für BEIDE!
+
 Ich verstehe:
-• "Was muss ich machen?" → Deine Aufgaben
-• "Zeige Moanas Aufgaben" → Aufgaben einer Person
-• "Zeige gemeinsame Aufgaben" → Aufgaben für beide
-• "Edeka - Tofu" → Neue Aufgabe mit Ort
-• "Moana & Jeremy: Geschenke kaufen" → Gemeinsame Aufgabe
+• "Müll rausbringen" → Gemeinsame Aufgabe
+• "Edeka - Milch" → Gemeinsame Einkaufsaufgabe
+• "Ich muss zum Arzt" → Nur für dich
+• "Moana muss X" → Nur für Moana
+• "Was muss ich machen?" → Deine Aufgaben (inkl. gemeinsame)
+• "Zeige gemeinsame Aufgaben" → Nur gemeinsame
 • "Müll ist erledigt" → Aufgabe abhaken
-• "Lösche Bad putzen" → Aufgabe löschen
 • "Rückgängig" → Letzte Aktion rückgängig
 
 📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Nicht konfiguriert'}`);
@@ -879,11 +900,13 @@ Ich verstehe:
     await bot.sendMessage(chatId, 
 `Ich verstehe "${text}" nicht. 
 
+Denk dran: Alle Aufgaben sind standardmäßig für beide!
+
 Versuch:
-• "Zeige Aufgaben"
-• "Edeka - Milch"
-• "Müll erledigt"
-• "Zeige gemeinsame Aufgaben"`);
+• "Müll rausbringen" → Gemeinsame Aufgabe
+• "Ich muss zum Arzt" → Nur für dich
+• "Zeige Aufgaben" → Alle Aufgaben
+• "Milch erledigt" → Aufgabe abhaken`);
     
   } catch (error) {
     console.error('Error:', error);
