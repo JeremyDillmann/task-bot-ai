@@ -1,38 +1,4 @@
-// Undo last action
-async function undoLastAction() {
-  if (!lastAction.type) {
-    return 'Nichts zum Rückgängigmachen.';
-  }
-  
-  const timeSince = Date.now() - lastAction.timestamp;
-  if (timeSince > 300000) { // 5 minutes
-    return 'Die letzte Aktion ist zu alt zum Rückgängigmachen (über 5 Minuten).';
-  }
-  
-  switch (lastAction.type) {
-    case 'add':
-      // Delete the tasks that were just added
-      let deleted = 0;
-      for (const taskName of lastAction.tasks) {
-        if (await deleteTask(taskName)) {
-          deleted++;
-        }
-      }
-      lastAction = { type: null, tasks: [], timestamp: null };
-      return `✅ ${deleted} Aufgaben rückgängig gemacht.`;
-      
-    case 'delete':
-      // Can't undo delete easily, but inform user
-      return '❌ Gelöschte Aufgaben können nicht wiederhergestellt werden.';
-      
-    case 'complete':
-      // Could implement uncomplete, but for now just inform
-      return '❌ Erledigte Aufgaben können nicht rückgängig gemacht werden.';
-      
-    default:
-      return 'Nichts zum Rückgängigmachen.';
-  }
-}// bot.js - Full version with AI and task assignment
+// bot.js - Full version with AI and task assignment
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -83,6 +49,9 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 const sheets = google.sheets({ version: 'v4', auth });
+
+// Track last action for undo
+let lastAction = null;
 
 // Helper to parse dates
 function parseDate(dateStr) {
@@ -152,13 +121,6 @@ async function getAllTasks() {
   }
 }
 
-// Track last action for undo
-let lastAction = {
-  type: null,  // 'add', 'delete', 'complete'
-  tasks: [],   // task names or row numbers
-  timestamp: null
-};
-
 // Add tasks with date parsing and person assignment
 async function addTasks(tasks, userName) {
   const existingTasks = await getAllTasks();
@@ -198,7 +160,7 @@ async function addTasks(tasks, userName) {
     lastAction = {
       type: 'add',
       tasks: addedTaskNames,
-      timestamp: new Date()
+      timestamp: Date.now()
     };
   }
   
@@ -220,6 +182,14 @@ async function completeTask(taskName) {
       valueInputOption: 'RAW',
       resource: { values: [['done']] }
     });
+    
+    // Track for undo (but can't really undo complete)
+    lastAction = {
+      type: 'complete',
+      task: task.task,
+      timestamp: Date.now()
+    };
+    
     return task.task;
   }
   return null;
@@ -288,6 +258,14 @@ async function deleteTask(taskName) {
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `A${task.row}:G${task.row}`,
     });
+    
+    // Track for undo (but can't really undo delete)
+    lastAction = {
+      type: 'delete',
+      task: task.task,
+      timestamp: Date.now()
+    };
+    
     return task.task;
   }
   return null;
@@ -302,23 +280,13 @@ async function deleteAllTasks() {
   activeTasks.sort((a, b) => b.row - a.row);
   
   let deleted = 0;
-  const deletedNames = [];
-  
   for (const task of activeTasks) {
     await sheets.spreadsheets.values.clear({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `A${task.row}:G${task.row}`,
     });
-    deletedNames.push(task.task);
     deleted++;
   }
-  
-  // Track for undo (though we can't restore deleted tasks)
-  lastAction = {
-    type: 'delete',
-    tasks: deletedNames,
-    timestamp: new Date()
-  };
   
   return deleted;
 }
@@ -350,6 +318,36 @@ async function removeDuplicates() {
   }
   
   return toDelete.length;
+}
+
+// Undo last action
+async function undoLastAction() {
+  if (!lastAction || Date.now() - lastAction.timestamp > 5 * 60 * 1000) {
+    return 'Keine kürzliche Aktion zum Rückgängigmachen gefunden (oder älter als 5 Minuten)';
+  }
+  
+  switch (lastAction.type) {
+    case 'add':
+      // Delete the recently added tasks
+      let deletedCount = 0;
+      for (const taskName of lastAction.tasks) {
+        const deleted = await deleteTask(taskName);
+        if (deleted) deletedCount++;
+      }
+      lastAction = null; // Clear after undo
+      return deletedCount > 0 
+        ? `✅ ${deletedCount} kürzlich hinzugefügte Aufgabe(n) gelöscht`
+        : 'Konnte die Aufgaben nicht finden';
+      
+    case 'complete':
+      return '⚠️ Erledigte Aufgaben können nicht rückgängig gemacht werden';
+      
+    case 'delete':
+      return '⚠️ Gelöschte Aufgaben können nicht wiederhergestellt werden';
+      
+    default:
+      return 'Keine Aktion zum Rückgängigmachen';
+  }
 }
 
 // Format task list with person filter
@@ -409,7 +407,7 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',  // Use the newer model for better understanding
+      model: 'gpt-4o-mini',  // Use available model
       messages: [
         { 
           role: 'system', 
@@ -420,20 +418,18 @@ WICHTIG:
 2. Wenn jemand sagt "[Person] muss/soll [Aufgabe]", dann weise die Aufgabe dieser Person zu (assignedTo).
 3. Wenn keine Person genannt wird, verwende den Absender als Standard.
 4. ORTE ERKENNEN: Bei Mustern wie "[Ort] - [Artikel]" oder "[Ort]: [Artikel]" ist der erste Teil der Ort!
-5. RÜCKGÄNGIG: Bei "falsch", "rückgängig", "undo", "löschen" (im Kontext von gerade hinzugefügten Aufgaben) nutze die undo Funktion.
+5. Wenn der User "falsch", "rückgängig", oder "undo" sagt, rufe die undo_last_action Funktion auf.
 
 Beispiele für Orte:
-- "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
-- "Hofpfisterei - Roggenbrot" = Aufgabe "Roggenbrot" mit location "Hofpfisterei"  
-- "DM - Shampoo" = Aufgabe "Shampoo" mit location "DM"
-- "Apotheke: Aspirin" = Aufgabe "Aspirin" mit location "Apotheke"
-- "Müll rausbringen" = Aufgabe "Müll rausbringen" ohne location
-- "Bei Aldi Milch holen" = Aufgabe "Milch holen" mit location "Aldi"
+- "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka" und category "shopping"
+- "Hofpfisterei - Roggenbrot" = Aufgabe "Roggenbrot" mit location "Hofpfisterei" und category "shopping"
+- "DM - Shampoo" = Aufgabe "Shampoo" mit location "DM" und category "shopping"
+- "Apotheke: Aspirin" = Aufgabe "Aspirin" mit location "Apotheke" und category "shopping"
+- "Müll rausbringen" = Aufgabe "Müll rausbringen" ohne location, category "household"
+- "Bei Aldi Milch holen" = Aufgabe "Milch holen" mit location "Aldi" und category "shopping"
 
 Bekannte Orte in Deutschland: Edeka, Rewe, Aldi, Lidl, Penny, Netto, DM, Rossmann, Müller, Hofpfisterei, Apotheke, etc.
-Diese Orte sind IMMER shopping Kategorie!
-
-UNDO: Bei "falsch", "rückgängig", "undo" nutze die undo Funktion statt alles zu löschen!
+Wenn ein bekannter Laden erkannt wird, setze IMMER category auf "shopping".
 
 Antworte auf Deutsch.`
         },
@@ -577,12 +573,8 @@ Antworte auf Deutsch.`
         {
           type: 'function',
           function: {
-            name: 'undo',
-            description: 'Mache die letzte Aktion rückgängig (nur für kürzlich hinzugefügte Aufgaben)',
-            parameters: {
-              type: 'object',
-              properties: {}
-            }
+            name: 'undo_last_action',
+            description: 'Mache die letzte Aktion rückgängig (nur für kürzlich hinzugefügte Aufgaben)'
           }
         }
       ],
@@ -643,9 +635,8 @@ Antworte auf Deutsch.`
             const assigned = await updateTask(args.taskName, { person: args.person });
             return assigned ? `✅ "${args.taskName}" wurde ${args.person} zugewiesen` : `Nicht gefunden: "${args.taskName}"`;
             
-          case 'undo':
+          case 'undo_last_action':
             return await undoLastAction();
-        }
         }
       }
     }
@@ -766,10 +757,11 @@ bot.on('message', async (msg) => {
 
 Sag einfach was du brauchst:
 • "Was muss ich machen?"
-• "Einkaufen bei Rewe"
+• "Edeka - Tofu, Hofpfisterei - Roggenbrot"
 • "Müll ist erledigt"
 • "Lösche Bad putzen"
 • "Moana muss morgen aufräumen"
+• "Falsch" oder "Rückgängig" (letzte Aktion)
 
 📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Not set'}`);
       return;
@@ -792,12 +784,6 @@ Sag einfach was du brauchst:
     }
     
     // Fallback patterns if AI fails
-    if (text.match(/rückgängig|undo|falsch.*lösch/i)) {
-      const result = await undoLastAction();
-      await bot.sendMessage(chatId, result);
-      return;
-    }
-    
     if (text.match(/aufgabe|liste|zeige|was muss/i)) {
       // Check if asking for specific person's tasks
       const personMatch = text.match(/(moana|jeremy|ich|meine)/i);
