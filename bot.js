@@ -1,4 +1,4 @@
-// bot.js - Full version with AI and task assignment
+// bot.js - Robust version with better shared task handling
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
@@ -43,18 +43,56 @@ app.post(`/webhook`, (req, res) => {
   res.sendStatus(200);
 });
 
-// Google Sheets setup
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS || '{}'),
-  scopes: ['https://www.googleapis.com/auth/spreadsheets']
-});
-const sheets = google.sheets({ version: 'v4', auth });
+// Google Sheets setup with error handling
+let sheets = null;
+try {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS || '{}');
+  if (credentials.client_email) {
+    const auth = new google.auth.GoogleAuth({
+      credentials: credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
+    });
+    sheets = google.sheets({ version: 'v4', auth });
+    console.log('✅ Google Sheets initialized');
+  } else {
+    console.error('❌ Invalid Google credentials');
+  }
+} catch (error) {
+  console.error('❌ Google Sheets init error:', error.message);
+}
 
 // Track last action for undo
 let lastAction = null;
 
+// Constants for shared task handling
+const SHARED_TASK_INDICATORS = ['both', 'beide', 'zusammen', 'gemeinsam', 'wir'];
+const SHARED_PERSON_VALUE = 'Beide'; // Standardized value for shared tasks
+
+// Helper to normalize person names
+function normalizePerson(person) {
+  if (!person) return '';
+  const lower = person.toLowerCase().trim();
+  
+  // Check if it's a shared indicator
+  if (SHARED_TASK_INDICATORS.includes(lower)) {
+    return SHARED_PERSON_VALUE;
+  }
+  
+  // Normalize known names
+  const nameMap = {
+    'moana': 'Moana',
+    'jeremy': 'Jeremy',
+    'ich': null, // Will be replaced with userName
+    'meine': null, // Will be replaced with userName
+  };
+  
+  return nameMap[lower] !== undefined ? nameMap[lower] : person;
+}
+
 // Helper to parse dates
 function parseDate(dateStr) {
+  if (!dateStr) return '';
+  
   const today = new Date();
   const tomorrow = new Date(today);
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -73,7 +111,7 @@ function parseDate(dateStr) {
     'sonntag': getNextWeekday(0)
   };
   
-  const lower = dateStr?.toLowerCase() || '';
+  const lower = dateStr.toLowerCase().trim();
   if (dayMap[lower]) {
     return dayMap[lower].toISOString().split('T')[0];
   }
@@ -96,8 +134,13 @@ function getNextWeekday(dayOfWeek) {
   return result;
 }
 
-// Get all tasks
+// Get all tasks with error handling
 async function getAllTasks() {
+  if (!sheets) {
+    console.error('Google Sheets not initialized');
+    return [];
+  }
+  
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -121,30 +164,55 @@ async function getAllTasks() {
   }
 }
 
-// Add tasks with date parsing and person assignment
+// Add tasks with better validation
 async function addTasks(tasks, userName) {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const existingTasks = await getAllTasks();
   const date = new Date().toISOString().split('T')[0];
   const newTasks = [];
-  const addedTaskNames = [];
+  const addedTaskInfo = [];
   
   for (const task of tasks) {
+    // Validate task
+    if (!task.task || task.task.trim() === '') continue;
+    
+    // Normalize person assignment
+    let assignedPerson = task.assignedTo || userName;
+    assignedPerson = normalizePerson(assignedPerson);
+    if (assignedPerson === null) assignedPerson = userName;
+    
+    // Check for duplicates
     const exists = existingTasks.some(existing => 
       existing.task.toLowerCase() === task.task.toLowerCase() &&
+      existing.person === assignedPerson &&
       existing.status !== 'done'
     );
     
     if (!exists) {
+      // Ensure shared tasks have proper category
+      let category = task.category || 'general';
+      if (assignedPerson === SHARED_PERSON_VALUE && category === 'general') {
+        category = 'both';
+      }
+      
       newTasks.push([
         date,
-        task.assignedTo || userName,  // Use assigned person or default to creator
-        task.task,
+        assignedPerson,
+        task.task.trim(),
         task.location || '',
         parseDate(task.when) || '',
-        task.category || 'general',
+        category,
         'pending'
       ]);
-      addedTaskNames.push(task.task);
+      
+      addedTaskInfo.push({
+        task: task.task.trim(),
+        person: assignedPerson,
+        isShared: assignedPerson === SHARED_PERSON_VALUE
+      });
     }
   }
   
@@ -159,16 +227,20 @@ async function addTasks(tasks, userName) {
     // Track for undo
     lastAction = {
       type: 'add',
-      tasks: addedTaskNames,
+      tasks: addedTaskInfo.map(t => t.task),
       timestamp: Date.now()
     };
   }
   
-  return newTasks.length;
+  return { count: newTasks.length, addedInfo: addedTaskInfo };
 }
 
 // Complete task
 async function completeTask(taskName) {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const tasks = await getAllTasks();
   const task = tasks.find(t => 
     t.task.toLowerCase().includes(taskName.toLowerCase()) && 
@@ -183,7 +255,6 @@ async function completeTask(taskName) {
       resource: { values: [['done']] }
     });
     
-    // Track for undo (but can't really undo complete)
     lastAction = {
       type: 'complete',
       task: task.task,
@@ -197,6 +268,10 @@ async function completeTask(taskName) {
 
 // Update task
 async function updateTask(taskName, updates) {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const tasks = await getAllTasks();
   const task = tasks.find(t => 
     t.task.toLowerCase().includes(taskName.toLowerCase()) && 
@@ -204,9 +279,15 @@ async function updateTask(taskName, updates) {
   );
   
   if (task) {
+    // Normalize person if updating
+    let person = task.person;
+    if (updates.person) {
+      person = normalizePerson(updates.person) || updates.person;
+    }
+    
     const updatedRow = [
       task.date,
-      updates.person || task.person,  // Can update person
+      person,
       updates.task || task.task,
       updates.location || task.location,
       parseDate(updates.when) || task.when,
@@ -228,6 +309,10 @@ async function updateTask(taskName, updates) {
 
 // Complete all tasks
 async function completeAllTasks() {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const tasks = await getAllTasks();
   const activeTasks = tasks.filter(t => t.status !== 'done');
   
@@ -247,6 +332,10 @@ async function completeAllTasks() {
 
 // Delete task
 async function deleteTask(taskName) {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const tasks = await getAllTasks();
   const task = tasks.find(t => 
     t.task.toLowerCase().includes(taskName.toLowerCase()) && 
@@ -259,7 +348,6 @@ async function deleteTask(taskName) {
       range: `A${task.row}:G${task.row}`,
     });
     
-    // Track for undo (but can't really undo delete)
     lastAction = {
       type: 'delete',
       task: task.task,
@@ -273,6 +361,10 @@ async function deleteTask(taskName) {
 
 // Delete all tasks
 async function deleteAllTasks() {
+  if (!sheets) {
+    throw new Error('Google Sheets nicht verfügbar');
+  }
+  
   const tasks = await getAllTasks();
   const activeTasks = tasks.filter(t => t.status !== 'done');
   
@@ -293,13 +385,15 @@ async function deleteAllTasks() {
 
 // Remove duplicates
 async function removeDuplicates() {
+  if (!sheets) return 0;
+  
   const tasks = await getAllTasks();
   const seen = new Map();
   const toDelete = [];
   
   tasks.forEach(task => {
     if (task.status === 'done') return;
-    const key = `${task.task.toLowerCase().trim()}_${task.location}_${task.when}`;
+    const key = `${task.task.toLowerCase().trim()}_${task.person}_${task.location}_${task.when}`;
     
     if (seen.has(key)) {
       toDelete.push(task.row);
@@ -328,13 +422,12 @@ async function undoLastAction() {
   
   switch (lastAction.type) {
     case 'add':
-      // Delete the recently added tasks
       let deletedCount = 0;
       for (const taskName of lastAction.tasks) {
         const deleted = await deleteTask(taskName);
         if (deleted) deletedCount++;
       }
-      lastAction = null; // Clear after undo
+      lastAction = null;
       return deletedCount > 0 
         ? `✅ ${deletedCount} kürzlich hinzugefügte Aufgabe(n) gelöscht`
         : 'Konnte die Aufgaben nicht finden';
@@ -350,21 +443,32 @@ async function undoLastAction() {
   }
 }
 
-// Format task list with person filter
+// Format task list with better shared task handling
 function formatTaskList(tasks, filterPerson = null) {
   const active = tasks.filter(t => t.status !== 'done');
   
   if (active.length === 0) return 'Alles erledigt! 🎉';
   
-  // Filter by person if specified
-  const filtered = filterPerson 
-    ? active.filter(t => t.person.toLowerCase() === filterPerson.toLowerCase())
-    : active;
+  // Normalize filter person
+  const normalizedFilter = filterPerson ? normalizePerson(filterPerson) : null;
   
-  if (filterPerson && filtered.length === 0) {
+  // Filter by person if specified
+  let filtered = active;
+  if (normalizedFilter) {
+    filtered = active.filter(t => {
+      const taskPerson = normalizePerson(t.person);
+      // Include personal tasks and shared tasks
+      return taskPerson === normalizedFilter || 
+             taskPerson === SHARED_PERSON_VALUE ||
+             (normalizedFilter === SHARED_PERSON_VALUE && taskPerson === SHARED_PERSON_VALUE);
+    });
+  }
+  
+  if (normalizedFilter && filtered.length === 0) {
     return `Keine Aufgaben für ${filterPerson} gefunden.`;
   }
   
+  // Group by category
   const byCategory = {};
   filtered.forEach(t => {
     const cat = t.category || 'general';
@@ -372,10 +476,28 @@ function formatTaskList(tasks, filterPerson = null) {
     byCategory[cat].push(t);
   });
   
-  let response = filterPerson 
-    ? `📋 ${filterPerson}'s Aufgaben (${filtered.length}):\n\n`
-    : `📋 Alle Aufgaben (${filtered.length}):\n\n`;
+  // Build response
+  let response = '';
+  if (normalizedFilter) {
+    response = `📋 ${filterPerson}'s Aufgaben (${filtered.length}):\n\n`;
+  } else {
+    response = `📋 Alle Aufgaben (${active.length}):\n\n`;
+  }
   
+  // Show shared tasks first if they exist
+  if (byCategory['both']) {
+    response += `👥 GEMEINSAME AUFGABEN:\n`;
+    byCategory['both'].forEach(t => {
+      response += `• ${t.task}`;
+      if (t.location) response += ` @${t.location}`;
+      if (t.when) response += ` (${t.when})`;
+      response += '\n';
+    });
+    response += '\n';
+    delete byCategory['both'];
+  }
+  
+  // Show other categories
   Object.entries(byCategory).forEach(([cat, tasks]) => {
     const emoji = {
       shopping: '🛒',
@@ -388,7 +510,10 @@ function formatTaskList(tasks, filterPerson = null) {
     response += `${emoji} ${cat.toUpperCase()}:\n`;
     tasks.forEach(t => {
       response += `• ${t.task}`;
-      if (t.person && !filterPerson) response += ` (${t.person})`;
+      // Show person only if not filtered and not a shared task
+      if (!normalizedFilter && t.person !== SHARED_PERSON_VALUE) {
+        response += ` (${t.person})`;
+      }
       if (t.location) response += ` @${t.location}`;
       if (t.when) response += ` (${t.when})`;
       response += '\n';
@@ -396,10 +521,10 @@ function formatTaskList(tasks, filterPerson = null) {
     response += '\n';
   });
   
-  return response;
+  return response.trim();
 }
 
-// AI handler with tool calling
+// AI handler with better shared task detection
 async function handleAI(text, tasks, userName, isGroup = false) {
   if (!openai) return null;
   
@@ -407,35 +532,40 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',  // Use available model
+      model: 'gpt-4o-mini',
       messages: [
         { 
           role: 'system', 
-          content: `Du bist ein hilfreicher Aufgaben-Bot. Du antwortest IMMER auf jede Nachricht. 
+          content: `Du bist ein hilfreicher Aufgaben-Bot für ein Paar (Moana und Jeremy). 
           
-WICHTIG: 
-1. Wenn der User mehrere Aufgaben in einer Nachricht erwähnt (durch Kommas, "und", oder neue Sätze getrennt), erkenne ALLE Aufgaben und füge sie einzeln hinzu.
-2. Wenn jemand sagt "[Person] muss/soll [Aufgabe]", dann weise die Aufgabe dieser Person zu (assignedTo).
-3. Wenn keine Person genannt wird, verwende den Absender als Standard.
-4. ORTE ERKENNEN: Bei Mustern wie "[Ort] - [Artikel]" oder "[Ort]: [Artikel]" ist der erste Teil der Ort!
-5. Wenn der User "falsch", "rückgängig", oder "undo" sagt, rufe die undo_last_action Funktion auf.
+KRITISCHE REGELN FÜR GEMEINSAME AUFGABEN:
+1. Wenn BEIDE Personen zusammen erwähnt werden (z.B. "Moana & Jeremy", "für beide", "wir müssen"), dann:
+   - ALLE nachfolgenden Aufgaben sind gemeinsam
+   - Setze assignedTo auf "Beide" (NICHT "Both", immer "Beide")
+   - Setze category auf "both"
+   - Dies gilt bis eine andere Person explizit genannt wird
 
-Beispiele für Orte:
-- "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka" und category "shopping"
-- "Hofpfisterei - Roggenbrot" = Aufgabe "Roggenbrot" mit location "Hofpfisterei" und category "shopping"
-- "DM - Shampoo" = Aufgabe "Shampoo" mit location "DM" und category "shopping"
-- "Apotheke: Aspirin" = Aufgabe "Aspirin" mit location "Apotheke" und category "shopping"
-- "Müll rausbringen" = Aufgabe "Müll rausbringen" ohne location, category "household"
-- "Bei Aldi Milch holen" = Aufgabe "Milch holen" mit location "Aldi" und category "shopping"
+2. Erkenne diese Muster als gemeinsame Aufgaben:
+   - "Moana & Jeremy haben folgende Aufgaben: X, Y, Z" → ALLE sind gemeinsam
+   - "Wir müssen noch..." → gemeinsam
+   - "Für beide: ..." → gemeinsam
+   - "Gemeinsame Aufgaben: ..." → gemeinsam
+   - Wenn jemand nach "Aufgaben für beide" fragt → das ist KEINE neue Aufgabe, sondern eine Frage!
 
-Bekannte Orte in Deutschland: Edeka, Rewe, Aldi, Lidl, Penny, Netto, DM, Rossmann, Müller, Hofpfisterei, Apotheke, etc.
-Wenn ein bekannter Laden erkannt wird, setze IMMER category auf "shopping".
+3. Einzelne Personen:
+   - "Jeremy muss X" → nur für Jeremy
+   - "Moana soll Y" → nur für Moana
+   - Wenn keine Person genannt → verwende den Absender (${userName})
 
-Antworte auf Deutsch.`
+4. WICHTIG: "und aufgaben für beide?" ist eine FRAGE, keine neue Aufgabe!
+
+5. Orte erkennen: "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
+
+Antworte immer auf Deutsch und sei freundlich.`
         },
         { 
           role: 'user', 
-          content: `Aktuelle Aufgaben: ${activeTasks.map(t => `"${t.task}" (Person: ${t.person || 'niemand'}, Ort: ${t.location || 'überall'}, Wann: ${t.when || 'flexibel'})`).join(', ')}\n\nUser (${userName}) sagt: "${text}"`
+          content: `User (${userName}) sagt: "${text}"\n\nAktuelle Aufgaben: ${activeTasks.length}`
         }
       ],
       tools: [
@@ -443,11 +573,14 @@ Antworte auf Deutsch.`
           type: 'function',
           function: {
             name: 'show_tasks',
-            description: 'Zeige alle Aufgaben oder Aufgaben einer bestimmten Person',
+            description: 'Zeige Aufgaben (für alle oder eine bestimmte Person)',
             parameters: {
               type: 'object',
               properties: {
-                person: { type: 'string', description: 'Filter nach Person (optional)' }
+                person: { 
+                  type: 'string', 
+                  description: 'Person filter: "Jeremy", "Moana", "Beide", oder leer für alle'
+                }
               }
             }
           }
@@ -456,7 +589,7 @@ Antworte auf Deutsch.`
           type: 'function',
           function: {
             name: 'add_tasks',
-            description: 'Füge eine oder mehrere neue Aufgaben hinzu',
+            description: 'Füge neue Aufgaben hinzu',
             parameters: {
               type: 'object',
               properties: {
@@ -467,17 +600,19 @@ Antworte auf Deutsch.`
                     properties: {
                       task: { type: 'string', description: 'Aufgabenbeschreibung' },
                       location: { type: 'string', description: 'Ort (optional)' },
-                      when: { type: 'string', description: 'Wann (z.B. morgen, Montag)' },
+                      when: { type: 'string', description: 'Wann (optional)' },
                       category: { 
                         type: 'string', 
-                        enum: ['shopping', 'household', 'personal', 'work', 'general'],
-                        description: 'Kategorie'
+                        enum: ['shopping', 'household', 'personal', 'work', 'both', 'general'],
+                        description: 'Kategorie (both für gemeinsame)'
                       },
-                      assignedTo: { type: 'string', description: 'Person, die die Aufgabe machen soll (optional)' }
+                      assignedTo: { 
+                        type: 'string', 
+                        description: 'Person: "Jeremy", "Moana", oder "Beide" für gemeinsame'
+                      }
                     },
                     required: ['task']
-                  },
-                  description: 'Liste von Aufgaben'
+                  }
                 }
               },
               required: ['tasks']
@@ -488,21 +623,14 @@ Antworte auf Deutsch.`
           type: 'function',
           function: {
             name: 'complete_task',
-            description: 'Markiere eine Aufgabe als erledigt',
+            description: 'Markiere Aufgabe als erledigt',
             parameters: {
               type: 'object',
               properties: {
-                taskName: { type: 'string', description: 'Name der Aufgabe' }
+                taskName: { type: 'string' }
               },
               required: ['taskName']
             }
-          }
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'complete_all_tasks',
-            description: 'Markiere ALLE Aufgaben als erledigt'
           }
         },
         {
@@ -513,7 +641,7 @@ Antworte auf Deutsch.`
             parameters: {
               type: 'object',
               properties: {
-                taskName: { type: 'string', description: 'Name der Aufgabe' }
+                taskName: { type: 'string' }
               },
               required: ['taskName']
             }
@@ -522,51 +650,22 @@ Antworte auf Deutsch.`
         {
           type: 'function',
           function: {
-            name: 'delete_all_tasks',
-            description: 'Lösche ALLE Aufgaben'
-          }
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'update_task_date',
-            description: 'Ändere das Datum einer Aufgabe',
+            name: 'update_task',
+            description: 'Aktualisiere eine Aufgabe',
             parameters: {
               type: 'object',
               properties: {
-                taskName: { type: 'string', description: 'Name der Aufgabe' },
-                when: { type: 'string', description: 'Neues Datum' }
+                taskName: { type: 'string' },
+                updates: {
+                  type: 'object',
+                  properties: {
+                    when: { type: 'string' },
+                    location: { type: 'string' },
+                    person: { type: 'string' }
+                  }
+                }
               },
-              required: ['taskName', 'when']
-            }
-          }
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'suggest_tasks',
-            description: 'Schlage passende Aufgaben vor basierend auf verfügbarer Zeit und/oder Ort',
-            parameters: {
-              type: 'object',
-              properties: {
-                time_available: { type: 'string', description: 'Verfügbare Zeit (z.B. "10 Minuten", "1 Stunde")' },
-                location: { type: 'string', description: 'Aktueller Ort (z.B. "zuhause", "unterwegs", "Büro")' }
-              }
-            }
-          }
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'assign_task',
-            description: 'Weise eine existierende Aufgabe einer Person zu',
-            parameters: {
-              type: 'object',
-              properties: {
-                taskName: { type: 'string', description: 'Name der Aufgabe' },
-                person: { type: 'string', description: 'Person, der die Aufgabe zugewiesen wird' }
-              },
-              required: ['taskName', 'person']
+              required: ['taskName', 'updates']
             }
           }
         },
@@ -574,7 +673,7 @@ Antworte auf Deutsch.`
           type: 'function',
           function: {
             name: 'undo_last_action',
-            description: 'Mache die letzte Aktion rückgängig (nur für kürzlich hinzugefügte Aufgaben)'
+            description: 'Mache die letzte Aktion rückgängig'
           }
         }
       ],
@@ -590,143 +689,68 @@ Antworte auf Deutsch.`
         const functionName = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments);
         
-        console.log(`Tool call: ${functionName}`, args);
+        console.log(`Tool call: ${functionName}`, JSON.stringify(args, null, 2));
         
         switch (functionName) {
           case 'show_tasks':
             return formatTaskList(tasks, args.person);
             
           case 'add_tasks':
-            const count = await addTasks(args.tasks, userName);
-            if (count === 1) {
-              const task = args.tasks[0];
-              const assignee = task.assignedTo || userName;
-              return `✅ Aufgabe für ${assignee} hinzugefügt: "${task.task}"`;
-            } else if (count > 1) {
-              return `✅ ${count} Aufgaben hinzugefügt!`;
-            } else {
-              return 'Diese Aufgaben existieren schon';
+            const result = await addTasks(args.tasks, userName);
+            if (result.count === 0) {
+              return 'Diese Aufgaben existieren bereits';
             }
+            
+            // Build response based on what was added
+            const sharedTasks = result.addedInfo.filter(t => t.isShared);
+            const personalTasks = result.addedInfo.filter(t => !t.isShared);
+            
+            let response = '✅ ';
+            if (sharedTasks.length > 0) {
+              response += `${sharedTasks.length} gemeinsame Aufgabe${sharedTasks.length > 1 ? 'n' : ''} hinzugefügt`;
+              if (personalTasks.length > 0) response += ' und ';
+            }
+            if (personalTasks.length > 0) {
+              const persons = [...new Set(personalTasks.map(t => t.person))];
+              response += `${personalTasks.length} Aufgabe${personalTasks.length > 1 ? 'n' : ''} für ${persons.join(', ')} hinzugefügt`;
+            }
+            response += '!';
+            
+            // Add details for single task
+            if (result.count === 1) {
+              const task = result.addedInfo[0];
+              response = `✅ ${task.isShared ? 'Gemeinsame Aufgabe' : `Aufgabe für ${task.person}`} hinzugefügt: "${task.task}"`;
+            }
+            
+            return response;
             
           case 'complete_task':
             const completed = await completeTask(args.taskName);
             return completed ? `✅ "${completed}" erledigt!` : `Nicht gefunden: "${args.taskName}"`;
             
-          case 'complete_all_tasks':
-            const allCompleted = await completeAllTasks();
-            return allCompleted > 0 ? `✅ Alle ${allCompleted} Aufgaben erledigt!` : 'Keine aktiven Aufgaben';
-            
           case 'delete_task':
             const deleted = await deleteTask(args.taskName);
             return deleted ? `🗑️ "${deleted}" gelöscht!` : `Nicht gefunden: "${args.taskName}"`;
             
-          case 'delete_all_tasks':
-            const allDeleted = await deleteAllTasks();
-            return allDeleted > 0 ? `🗑️ Alle ${allDeleted} Aufgaben gelöscht!` : 'Keine aktiven Aufgaben';
-            
-          case 'update_task_date':
-            const updated = await updateTask(args.taskName, { when: args.when });
-            return updated ? `✅ "${args.taskName}" verschoben auf ${parseDate(args.when)}` : `Nicht gefunden: "${args.taskName}"`;
-            
-          case 'suggest_tasks':
-            return suggestTasks(tasks, args.time_available, args.location);
-            
-          case 'assign_task':
-            const assigned = await updateTask(args.taskName, { person: args.person });
-            return assigned ? `✅ "${args.taskName}" wurde ${args.person} zugewiesen` : `Nicht gefunden: "${args.taskName}"`;
+          case 'update_task':
+            const updated = await updateTask(args.taskName, args.updates);
+            return updated ? `✅ Aufgabe aktualisiert!` : `Nicht gefunden: "${args.taskName}"`;
             
           case 'undo_last_action':
             return await undoLastAction();
+            
+          default:
+            console.error(`Unknown function: ${functionName}`);
         }
       }
     }
     
-    // Always return something - either tool result or message content
     return message.content || 'Ich bin mir nicht sicher, was du meinst. Kannst du es anders formulieren?';
     
   } catch (error) {
-    console.error('AI Error:', error.message);
+    console.error('AI Error:', error);
     return null;
   }
-}
-
-// Suggest tasks based on time and location
-function suggestTasks(tasks, timeAvailable, location) {
-  const active = tasks.filter(t => t.status !== 'done');
-  
-  if (active.length === 0) {
-    return '🎉 Super! Du hast keine offenen Aufgaben!';
-  }
-  
-  // Parse time to minutes
-  let minutes = 0;
-  if (timeAvailable) {
-    const timeMatch = timeAvailable.match(/(\d+)\s*(minute|minuten|stunde|stunden|hour)/i);
-    if (timeMatch) {
-      const value = parseInt(timeMatch[1]);
-      const unit = timeMatch[2].toLowerCase();
-      if (unit.includes('stunde') || unit.includes('hour')) {
-        minutes = value * 60;
-      } else {
-        minutes = value;
-      }
-    }
-  }
-  
-  // Filter tasks by location and estimated time
-  let suggested = active;
-  
-  // Location filtering
-  if (location) {
-    const locationLower = location.toLowerCase();
-    if (locationLower.includes('zuhause') || locationLower.includes('home')) {
-      suggested = suggested.filter(t => 
-        !t.location || 
-        t.location.toLowerCase().includes('zuhause') ||
-        t.category === 'household'
-      );
-    } else if (locationLower.includes('unterwegs') || locationLower.includes('draußen')) {
-      suggested = suggested.filter(t => 
-        t.location && !t.location.toLowerCase().includes('zuhause') ||
-        t.category === 'shopping'
-      );
-    }
-  }
-  
-  // Time filtering - quick tasks for short time
-  if (minutes > 0 && minutes <= 15) {
-    // Prioritize quick tasks
-    const quickTasks = ['geschirrspüler', 'müll', 'aufräumen', 'saugroboter'];
-    suggested = suggested.filter(t => 
-      quickTasks.some(quick => t.task.toLowerCase().includes(quick))
-    );
-  } else if (minutes > 15 && minutes <= 30) {
-    // Medium tasks
-    const mediumTasks = ['saugen', 'bad', 'küche', 'einkaufen'];
-    suggested = suggested.filter(t => 
-      mediumTasks.some(medium => t.task.toLowerCase().includes(medium))
-    );
-  }
-  
-  // Build response
-  if (suggested.length === 0) {
-    return `Hmm, ich finde keine passenden Aufgaben für ${timeAvailable || ''} ${location || ''}. Hier sind alle deine Aufgaben:\n\n${formatTaskList(tasks)}`;
-  }
-  
-  let response = `💡 Vorschläge für ${timeAvailable || ''} ${location || ''}:\n\n`;
-  
-  suggested.forEach(t => {
-    response += `• ${t.task}`;
-    if (t.person) response += ` (${t.person})`;
-    if (t.location) response += ` @${t.location}`;
-    response += '\n';
-  });
-  
-  if (suggested.length < active.length) {
-    response += `\n(${active.length - suggested.length} weitere Aufgaben vorhanden)`;
-  }
-  
-  return response;
 }
 
 // Message handler
@@ -741,6 +765,12 @@ bot.on('message', async (msg) => {
   console.log(`Message from ${userName} in ${isGroup ? 'group' : 'private'}: ${text}`);
   
   try {
+    // Check if sheets is available
+    if (!sheets) {
+      await bot.sendMessage(chatId, '❌ Google Sheets ist nicht konfiguriert. Bitte überprüfe die Umgebungsvariablen.');
+      return;
+    }
+    
     // Remove duplicates first
     const duplicatesRemoved = await removeDuplicates();
     if (duplicatesRemoved > 0) {
@@ -753,46 +783,48 @@ bot.on('message', async (msg) => {
     // Commands
     if (text === '/start' || text === '/help') {
       await bot.sendMessage(chatId, 
-`Hallo! Ich bin dein Aufgaben-Bot 🤖
+`Hallo! Ich bin euer Aufgaben-Bot 🤖
 
-Sag einfach was du brauchst:
-• "Was muss ich machen?"
-• "Edeka - Tofu, Hofpfisterei - Roggenbrot"
-• "Müll ist erledigt"
-• "Lösche Bad putzen"
-• "Moana muss morgen aufräumen"
-• "Falsch" oder "Rückgängig" (letzte Aktion)
+Ich verstehe:
+• "Was muss ich machen?" → Deine Aufgaben
+• "Zeige Moanas Aufgaben" → Aufgaben einer Person
+• "Zeige gemeinsame Aufgaben" → Aufgaben für beide
+• "Edeka - Tofu" → Neue Aufgabe mit Ort
+• "Moana & Jeremy: Geschenke kaufen" → Gemeinsame Aufgabe
+• "Müll ist erledigt" → Aufgabe abhaken
+• "Lösche Bad putzen" → Aufgabe löschen
+• "Rückgängig" → Letzte Aktion rückgängig
 
-📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Not set'}`);
+📊 Sheet: ${process.env.GOOGLE_SHEET_URL || 'Nicht konfiguriert'}`);
       return;
     }
     
-    // Try AI - always process messages
+    // Try AI if available
     if (openai) {
-      // Clean text for processing (remove bot mentions)
       let cleanText = text;
       if (isGroup) {
         const botUsername = (await bot.getMe()).username;
         cleanText = text.replace(`@${botUsername}`, '').trim();
       }
       
-      const aiResponse = await handleAI(cleanText, tasks, userName, false);
+      const aiResponse = await handleAI(cleanText, tasks, userName, isGroup);
       if (aiResponse) {
         await bot.sendMessage(chatId, aiResponse);
         return;
       }
     }
     
-    // Fallback patterns if AI fails
+    // Fallback patterns if AI fails or is not available
     if (text.match(/aufgabe|liste|zeige|was muss/i)) {
-      // Check if asking for specific person's tasks
-      const personMatch = text.match(/(moana|jeremy|ich|meine)/i);
+      const personMatch = text.match(/(moana|jeremy|ich|meine|beide|gemeinsam)/i);
       let filterPerson = null;
       
       if (personMatch) {
         const person = personMatch[1].toLowerCase();
         if (person === 'ich' || person === 'meine') {
           filterPerson = userName;
+        } else if (person === 'beide' || person === 'gemeinsam') {
+          filterPerson = SHARED_PERSON_VALUE;
         } else {
           filterPerson = person.charAt(0).toUpperCase() + person.slice(1);
         }
@@ -815,29 +847,45 @@ Sag einfach was du brauchst:
       return;
     }
     
-    // Default
-    await bot.sendMessage(chatId, 'Ich verstehe nicht. Versuch: "zeige aufgaben" oder "X erledigt"');
+    if (text.match(/rückgängig|undo|falsch/i)) {
+      const result = await undoLastAction();
+      await bot.sendMessage(chatId, result);
+      return;
+    }
+    
+    // Default message
+    await bot.sendMessage(chatId, 
+`Ich verstehe "${text}" nicht. 
+
+Versuch:
+• "Zeige Aufgaben"
+• "Edeka - Milch"
+• "Müll erledigt"
+• "Zeige gemeinsame Aufgaben"`);
     
   } catch (error) {
-    console.error('Error:', error.message);
-    await bot.sendMessage(chatId, '❌ Fehler: ' + error.message);
+    console.error('Error:', error);
+    await bot.sendMessage(chatId, `❌ Fehler: ${error.message}`);
   }
+});
+
+// Error handler for bot
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error);
 });
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
   
   // Set webhook after server is listening
   setTimeout(async () => {
     try {
-      const WEBHOOK_URL = `https://task-bot-ai-production.up.railway.app/webhook`;
+      const webhookUrl = process.env.WEBHOOK_URL || `https://${process.env.RAILWAY_STATIC_URL || 'localhost'}/webhook`;
       
-      console.log('Deleting old webhook...');
+      console.log('Setting webhook to:', webhookUrl);
       await bot.deleteWebHook();
-      
-      console.log('Setting new webhook...');
-      const result = await bot.setWebHook(WEBHOOK_URL);
+      const result = await bot.setWebHook(webhookUrl);
       console.log('✅ Webhook set:', result);
       
       const info = await bot.getWebHookInfo();
@@ -845,19 +893,30 @@ const server = app.listen(PORT, '0.0.0.0', () => {
       
     } catch (error) {
       console.error('❌ Webhook error:', error.message);
+      console.log('Falling back to polling mode...');
+      bot.startPolling();
     }
   }, 2000);
 });
 
-// Keep alive - IGNORE SIGTERM
+// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received - IGNORING (staying alive)');
+  console.log('SIGTERM received - shutting down gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received - IGNORING (staying alive)');
+  console.log('SIGINT received - shutting down gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
 
+// Error handling
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
   process.exit(1);
@@ -867,11 +926,9 @@ process.on('unhandledRejection', (error) => {
   console.error('Unhandled Rejection:', error);
 });
 
-process.stdin.resume();
-
 // Heartbeat
 setInterval(() => {
-  console.log('💓 Bot alive at', new Date().toISOString());
+  console.log(`💓 Bot alive - Tasks: ${sheets ? 'Connected' : 'Not connected'}, AI: ${openai ? 'Connected' : 'Not connected'}`);
 }, 30000);
 
-console.log('Starting bot WITH AI...');
+console.log('Starting bot...');
