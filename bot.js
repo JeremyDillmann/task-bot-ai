@@ -479,8 +479,8 @@ async function undoLastAction() {
   }
 }
 
-// Format task list with better shared task handling
-function formatTaskList(tasks, filterPerson = null) {
+// Format task list with better shared task handling and location filter
+function formatTaskList(tasks, filterPerson = null, filterLocation = null) {
   const active = tasks.filter(t => t.status !== 'done');
   
   if (active.length === 0) return 'Alles erledigt! 🎉';
@@ -501,7 +501,18 @@ function formatTaskList(tasks, filterPerson = null) {
     filtered = active.filter(t => normalizePerson(t.person) === SHARED_PERSON_VALUE);
   }
   
-  if (normalizedFilter && filtered.length === 0) {
+  // Filter by location if specified
+  if (filterLocation) {
+    const locationLower = filterLocation.toLowerCase();
+    filtered = filtered.filter(t => 
+      t.location && t.location.toLowerCase().includes(locationLower)
+    );
+  }
+  
+  if ((normalizedFilter || filterLocation) && filtered.length === 0) {
+    if (filterLocation) {
+      return `Keine Aufgaben bei ${filterLocation} gefunden.`;
+    }
     return `Keine Aufgaben für ${filterPerson} gefunden.`;
   }
   
@@ -515,7 +526,9 @@ function formatTaskList(tasks, filterPerson = null) {
   
   // Build response
   let response = '';
-  if (normalizedFilter && normalizedFilter !== SHARED_PERSON_VALUE) {
+  if (filterLocation) {
+    response = `📍 Aufgaben bei ${filterLocation} (${filtered.length}):\n\n`;
+  } else if (normalizedFilter && normalizedFilter !== SHARED_PERSON_VALUE) {
     response = `📋 ${filterPerson}'s Aufgaben (${filtered.length}):\n\n`;
   } else if (normalizedFilter === SHARED_PERSON_VALUE) {
     response = `👥 Gemeinsame Aufgaben (${filtered.length}):\n\n`;
@@ -528,7 +541,7 @@ function formatTaskList(tasks, filterPerson = null) {
     response += `👥 GEMEINSAME AUFGABEN:\n`;
     byCategory['both'].forEach(t => {
       response += `• ${t.task}`;
-      if (t.location) response += ` @${t.location}`;
+      if (t.location && !filterLocation) response += ` @${t.location}`;
       if (t.when) response += ` (${t.when})`;
       response += '\n';
     });
@@ -553,7 +566,7 @@ function formatTaskList(tasks, filterPerson = null) {
       if (!normalizedFilter && t.person !== SHARED_PERSON_VALUE) {
         response += ` (nur ${t.person})`;
       }
-      if (t.location) response += ` @${t.location}`;
+      if (t.location && !filterLocation) response += ` @${t.location}`;
       if (t.when) response += ` (${t.when})`;
       response += '\n';
     });
@@ -571,7 +584,7 @@ async function handleAI(text, tasks, userName, isGroup = false) {
     const activeTasks = tasks.filter(t => t.status !== 'done');
     
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', // or 'gpt-4-turbo' for faster GPT-4
+      model: 'gpt-4o', // or 'gpt-4-turbo' for faster GPT-4
       messages: [
         { 
           role: 'system', 
@@ -596,11 +609,16 @@ KRITISCHE REGELN:
    - "Jeremy muss zum Zahnarzt" → assignedTo: "Jeremy"
    - "Moana soll Yoga machen" → assignedTo: "Moana"
 
-4. WICHTIG: Bei Aufgaben ohne Personenbezug → IMMER "Beide"!
+4. ORTSBASIERTE ABFRAGEN:
+   - "Bin bei DM, was brauch ich?" → show_tasks mit location: "DM"
+   - "Was muss ich bei Edeka holen?" → show_tasks mit location: "Edeka"
+   - "Was gibt's bei Rewe?" → show_tasks mit location: "Rewe"
+   
+5. WICHTIG: Bei Aufgaben ohne Personenbezug → IMMER "Beide"!
 
-5. Orte erkennen: "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
+6. Orte erkennen: "Edeka - Tofu" = Aufgabe "Tofu" mit location "Edeka"
 
-6. "und aufgaben für beide?" ist eine FRAGE, keine neue Aufgabe!
+7. "und aufgaben für beide?" ist eine FRAGE, keine neue Aufgabe!
 
 Antworte immer auf Deutsch und sei freundlich.`
         },
@@ -621,6 +639,10 @@ Antworte immer auf Deutsch und sei freundlich.`
                 person: { 
                   type: 'string', 
                   description: 'Person filter: "Jeremy", "Moana", "Beide", oder leer für alle'
+                },
+                location: {
+                  type: 'string',
+                  description: 'Ort filter: "DM", "Edeka", "Rewe", etc. - zeigt nur Aufgaben an diesem Ort'
                 }
               }
             }
@@ -734,7 +756,7 @@ Antworte immer auf Deutsch und sei freundlich.`
         
         switch (functionName) {
           case 'show_tasks':
-            return formatTaskList(tasks, args.person);
+            return formatTaskList(tasks, args.person, args.location);
             
           case 'add_tasks':
             const result = await addTasks(args.tasks, userName);
@@ -834,7 +856,8 @@ Ich verstehe:
 • "Ich muss zum Arzt" → Nur für dich
 • "Moana muss X" → Nur für Moana
 • "Was muss ich machen?" → Deine Aufgaben (inkl. gemeinsame)
-• "Zeige gemeinsame Aufgaben" → Nur gemeinsame
+• "Bin bei DM, was brauch ich?" → Nur DM-Aufgaben
+• "Was gibt's bei Edeka?" → Nur Edeka-Aufgaben
 • "Müll ist erledigt" → Aufgabe abhaken
 • "Rückgängig" → Letzte Aktion rückgängig
 
@@ -905,6 +928,7 @@ Denk dran: Alle Aufgaben sind standardmäßig für beide!
 Versuch:
 • "Müll rausbringen" → Gemeinsame Aufgabe
 • "Ich muss zum Arzt" → Nur für dich
+• "Bin bei DM" → Zeigt DM-Aufgaben
 • "Zeige Aufgaben" → Alle Aufgaben
 • "Milch erledigt" → Aufgabe abhaken`);
     
